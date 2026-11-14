@@ -1,5 +1,22 @@
-# CHANGELOG
+﻿# CHANGELOG
 
+## 3.0.1（2026-11-14）
+
+### 新增
+
+- **媒体投影**：`generate_image` / `generate_video` 工具结果里的
+  `images[].attachment_id` → `image` 块、`videos[].url` → `video` 块（`media:<文件名>` 引用），
+  手机端无需电脑路径即可加载素材
+- **视频字节路由**：`GET /api/media/:name`（`send` 流式，支持 Range/206，可直接拖动播放），
+  服务 `$DSH_HOME/dsh-imagegen/videos/files`
+- **通用文件下载**：`GET /api/files/:attachmentId`，服务 `attachments/v1/file-objects` 内容寻址对象
+- **冒烟测试** 23 → 27 项（媒体二进制、Range 206、路径穿越拒绝、投影断言）
+
+### 变更
+
+- 助手 / 工具正文里的**本机绝对路径图片链接**被剥离（`![...](C:\...)`），不再把电脑路径透传到手机
+- 生成类工具结果的正文从整段 JSON 换成其 `message` 字段（友好文案），错误时附 `error` 行
+- 冒烟测试隔离 `$DSH_HOME`，不再污染真实 `~/.dsh/phone-bridge/model.json`
 ## 3.0.0（2026-11-13）
 
 这是一次**重写**，v2 的「聊天原型」被完全替换为商业级桥接层。

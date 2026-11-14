@@ -16,15 +16,122 @@
  * 并用 C:\Users\CGLY\.dsh\sessions 下真实 session.v4.jsonl.zstd 逐条核对。
  */
 
+/**
+ * 本机绝对路径（Windows 盘符 / UNC），手机端无法加载。
+ * 生成类工具会把落盘路径写进正文（`![生成图片](C:\...\x.png)`），
+ * 直接透传会让手机只看到一串路径，所以这里统一剥掉。
+ */
+function isLocalAbsolutePath(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\');
+}
+
+const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+
+/** 去掉指向本机磁盘的图片 markdown（图片本身改由 image 块渲染）。 */
+function stripLocalMediaPaths(text) {
+  if (typeof text !== 'string' || text.length === 0) return '';
+  return text
+    .replace(MARKDOWN_IMAGE, (whole, alt, target) => (isLocalAbsolutePath(target) ? '' : whole))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** 从 URL 取最后一段作为文件名。 */
+function fileNameOfUrl(url) {
+  if (typeof url !== 'string' || url.length === 0) return '';
+  const clean = url.split('?')[0].split('#')[0];
+  const parts = clean.split('/');
+  const last = parts.length > 0 ? parts[parts.length - 1] : '';
+  return decodeURIComponent(last);
+}
+
+/**
+ * 从生成类工具的结果文本里抽取媒体引用。
+ *
+ * 实测形状（dsh-imagegen-video 3.x，本机 2026-11-14）：
+ *   generate_image → {"images":[{"attachment_id":"sha256:<hex>","media_type":"image/png",
+ *                                "bytes":1710437,"width":1024,"height":1024,"name":"..."}],
+ *                     "files":["C:\\Users\\...\\dsh-imagegen\\images\\<id>-0.png"]}
+ *   generate_video → {"videos":[{"url":"/api/dsh-imagegen/video/file/<file>.mp4",
+ *                                "mime":"video/mp4","duration":5}]}
+ *
+ * 图片走附件字节（/api/attachments/:id），视频走桥的媒体文件路由（/api/media/<file>），
+ * 两者都变成手机可直接加载的块，不再依赖电脑上的路径。
+ */
+function extractMediaBlocks(text) {
+  const blocks = [];
+  if (typeof text !== 'string' || text.length === 0) return blocks;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return blocks;
+  }
+  if (parsed === null || typeof parsed !== 'object') return blocks;
+
+    const images = Array.isArray(parsed.images) ? parsed.images : [];
+  for (const image of images) {
+    if (image === null || typeof image !== 'object') continue;
+    const id = typeof image.attachment_id === 'string' ? image.attachment_id : '';
+    if (id.length === 0) continue;
+    blocks.push({
+      type: 'image',
+      attachmentId: id,
+      mediaType: typeof image.media_type === 'string' ? image.media_type : '',
+      width: typeof image.width === 'number' ? image.width : 0,
+      height: typeof image.height === 'number' ? image.height : 0,
+      name: typeof image.name === 'string' ? image.name : '',
+    });
+  }
+
+  const videos = Array.isArray(parsed.videos) ? parsed.videos : [];
+  for (const video of videos) {
+    if (video === null || typeof video !== 'object') continue;
+    const url = typeof video.url === 'string' ? video.url : '';
+    const name = fileNameOfUrl(url);
+    if (name.length === 0) continue;
+    blocks.push({
+      type: 'video',
+      attachmentId: `media:${name}`,
+      mediaType: typeof video.mime === 'string' ? video.mime : '',
+      width: 0,
+      height: 0,
+      name,
+    });
+  }
+  return blocks;
+}
+
+/**
+ * 生成类工具的结果正文是整段 JSON（task_id/status/videos…），
+ * 手机上直接渲染可读性差；抽到媒体块后，把正文换成 JSON 里的
+ * 人类可读 message 字段（没有就保留原文）。
+ */
+function friendlyToolText(text) {
+  if (typeof text !== 'string' || text.length === 0) return '';
+  if (!text.startsWith('{')) return text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed !== null && typeof parsed === 'object' && typeof parsed.message === 'string' && parsed.message.length > 0) {
+      const error = typeof parsed.error === 'string' && parsed.error.length > 0 ? `\n错误：${parsed.error}` : '';
+      return parsed.message + error;
+    }
+  } catch {
+    // 非 JSON，保留原文
+  }
+  return text;
+}
+
 /** 把 DSH ContentBlock 转成手机线格式块。 */
 export function blockToWire(block) {
   if (block === null || typeof block !== 'object') return null;
   const type = block.type;
   if (type === 'text') {
-    return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
+    return { type: 'text', text: stripLocalMediaPaths(typeof block.text === 'string' ? block.text : '') };
   }
   if (type === 'reasoning') {
-    return { type: 'reasoning', text: typeof block.text === 'string' ? block.text : '' };
+    return { type: 'reasoning', text: stripLocalMediaPaths(typeof block.text === 'string' ? block.text : '') };
   }
   if (type === 'image') {
     const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : {};
@@ -44,6 +151,17 @@ export function blockToWire(block) {
       attachmentId: typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '',
       name: typeof attachment.name === 'string' ? attachment.name : '',
       bytes: typeof attachment.bytes === 'number' ? attachment.bytes : 0,
+    };
+  }
+  if (type === 'video') {
+    const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : {};
+    return {
+      type: 'video',
+      attachmentId: typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '',
+      mediaType: typeof attachment.mediaType === 'string' ? attachment.mediaType : '',
+      width: typeof attachment.width === 'number' ? attachment.width : 0,
+      height: typeof attachment.height === 'number' ? attachment.height : 0,
+      name: typeof attachment.name === 'string' ? attachment.name : '',
     };
   }
   if (type === 'tool-call') {
@@ -258,7 +376,7 @@ export function projectEvents(events) {
         turn: typeof data.turn === 'number' ? data.turn : currentTurn,
         step: typeof data.step === 'number' ? data.step : currentStep,
         blocks,
-        text: textOfBlocks(message.content),
+        text: stripLocalMediaPaths(textOfBlocks(message.content)),
         provider: typeof source.provider === 'string' ? source.provider : '',
         model: typeof source.model === 'string' ? source.model : '',
         usage: usageToWire(data.usage),
@@ -280,6 +398,15 @@ export function projectEvents(events) {
         ? message.toolCallId
         : (typeof data.callId === 'string' ? data.callId : '');
       const blocks = blocksToWire(message.content);
+      const rawText = textOfBlocks(message.content);
+      const friendlyText = friendlyToolText(rawText);
+      // 生成类工具（生图/生视频）只返回媒体引用或路径，没有可渲染的块；
+      // 这里把引用补成 image / video 块，手机端才能真正看到素材。
+      for (const media of extractMediaBlocks(rawText)) {
+        if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
+          blocks.push(media);
+        }
+      }
       const error = data.error && typeof data.error === 'object' ? data.error : undefined;
       messages.push({
         id: typeof message.id === 'string' ? message.id : `t_${seq}`,
@@ -289,7 +416,7 @@ export function projectEvents(events) {
         turn: typeof data.turn === 'number' ? data.turn : currentTurn,
         step: typeof data.step === 'number' ? data.step : currentStep,
         blocks,
-        text: textOfBlocks(message.content),
+        text: stripLocalMediaPaths(friendlyText),
         callId,
         toolName: toolNames.get(callId) ?? '',
         isError: message.isError === true || error !== undefined,
@@ -448,7 +575,7 @@ export function eventToWire(sessionId, event) {
         id: typeof message.id === 'string' ? message.id : `a_${seq}`,
         role: 'assistant',
         blocks,
-        text: textOfBlocks(message.content),
+        text: stripLocalMediaPaths(textOfBlocks(message.content)),
         provider: typeof source.provider === 'string' ? source.provider : '',
         model: typeof source.model === 'string' ? source.model : '',
         usage: usageToWire(data.usage),
@@ -461,6 +588,13 @@ export function eventToWire(sessionId, event) {
   if (type === 'tool/result') {
     const message = data.message && typeof data.message === 'object' ? data.message : {};
     const blocks = blocksToWire(message.content);
+    const rawText = textOfBlocks(message.content);
+    const friendlyText = friendlyToolText(rawText);
+    for (const media of extractMediaBlocks(rawText)) {
+      if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
+        blocks.push(media);
+      }
+    }
     const error = data.error && typeof data.error === 'object' ? data.error : undefined;
     return {
       name: 'message.part',
@@ -472,7 +606,7 @@ export function eventToWire(sessionId, event) {
         role: 'tool',
         kind: 'tool-result',
         blocks,
-        text: textOfBlocks(message.content),
+        text: stripLocalMediaPaths(friendlyText),
         callId: typeof message.toolCallId === 'string' ? message.toolCallId : '',
         isError: message.isError === true || error !== undefined,
         turn: data.turn ?? 0,

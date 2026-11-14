@@ -887,6 +887,66 @@ export class DshAdapter {
     return { data, mediaType: guessImageMediaType(hex, data) };
   }
 
+  /**
+   * 读取一个通用文件附件的原始字节（工具结果里的 file 块）。
+   *
+   * 存储布局（dsh-attachment-local 源码核实）：$DSH_HOME/attachments/v1/file-objects/<hex 前 2 位>/<hex>
+   * 与图片对象分开存放，文件名不含扩展名；显示名随块下发，不在存储里。
+   *
+   * @param {string} attachmentId 形如 sha256:<64 位 hex>
+   * @returns {Promise<{ data: Buffer }>}
+   */
+  async readGenericAttachment(attachmentId) {
+    const id = typeof attachmentId === 'string' ? attachmentId.trim() : '';
+    const hex = id.startsWith('sha256:') ? id.slice('sha256:'.length) : id;
+    if (!/^[0-9a-f]{64}$/i.test(hex)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `附件 ID 非法：${id}`);
+    }
+
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const file = path.join(home, 'attachments', 'v1', 'file-objects', hex.slice(0, 2), hex);
+    let data;
+    try {
+      data = await fs.promises.readFile(file);
+    } catch {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '文件附件不存在', { detail: { attachmentId: id } });
+    }
+    return { data };
+  }
+
+  /**
+   * 读取一个已落盘的媒体文件（目前用于 AI 生成视频）。
+   *
+   * 事实来源（dsh-imagegen-video 3.x 源码 + 本机实测）：
+   *   视频持久化在 $DSH_HOME/dsh-imagegen/videos/files/<file>，
+   *   工具结果只返回 `/api/dsh-imagegen/video/file/<file>` 这样的同源相对 URL，
+   *   字节从不进入会话。手机端加载不了电脑上的路径，所以由桥按文件名转出字节。
+   *
+   * 只接受纯文件名（拒绝任何目录分隔符与 `..`），避免路径穿越。
+   *
+   * @param {string} name 视频文件名，例如 `abc.mp4`
+   * @returns {Promise<{ root: string, fileName: string }>}
+   */
+  async mediaFilePath(name) {
+    const fileName = typeof name === 'string' ? name.trim() : '';
+    if (fileName.length === 0 || fileName !== path.basename(fileName) || fileName.includes('..')) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
+    }
+
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const file = path.join(home, 'dsh-imagegen', 'videos', 'files', fileName);
+    let stat = null;
+    try {
+      stat = await fs.promises.stat(file);
+    } catch {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '媒体文件不存在', { detail: { name: fileName } });
+    }
+    if (stat.isDirectory()) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
+    }
+    return { root: path.dirname(file), fileName };
+  }
+
   // ── 工作区 ─────────────────────────────────────────────────────────────
 
   /** 列出工作区（供"新建会话"选择目录）。 */

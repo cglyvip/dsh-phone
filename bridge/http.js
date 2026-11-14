@@ -23,6 +23,7 @@ import {
   optionalBoolean,
   sendJson,
 } from './errors.js';
+import send from 'send';
 
 /** 极简路由表：method + 正则 → handler(params, ctx) */
 function matchRoute(routes, method, pathname) {
@@ -67,6 +68,8 @@ export function createHttpHandler(deps) {
     { method: 'GET', pattern: /^\/api\/workspaces$/, handler: handleListWorkspaces },
     { method: 'GET', pattern: /^\/api\/dirs$/, handler: handleListDirs },
     { method: 'GET', pattern: /^\/api\/attachments\/([^/]+)$/, handler: handleAttachment, raw: true },
+    { method: 'GET', pattern: /^\/api\/media\/([^/]+)$/, handler: handleMediaFile, raw: true },
+    { method: 'GET', pattern: /^\/api\/files\/([^/]+)$/, handler: handleFileAttachment, raw: true },
     { method: 'GET', pattern: /^\/api\/sync$/, handler: handleSync },
     { method: 'GET', pattern: /^\/api\/search$/, handler: handleSearch },
   ];
@@ -244,6 +247,31 @@ export function createHttpHandler(deps) {
     };
   }
 
+  /** 已落盘的媒体文件（AI 生成视频），按文件名转出字节。 */
+  async function handleMediaFile(params) {
+    const raw = Array.isArray(params) && params.length > 0 ? params[0] : '';
+    const name = decodeURIComponent(raw);
+    const media = await adapter.mediaFilePath(name);
+    return {
+      __stream: true,
+      root: media.root,
+      fileName: media.fileName,
+    };
+  }
+
+  /** 通用文件附件（工具结果里的 file 块），按内容寻址转出字节。 */
+  async function handleFileAttachment(params) {
+    const raw = Array.isArray(params) && params.length > 0 ? params[0] : '';
+    const attachmentId = decodeURIComponent(raw);
+    const stored = await adapter.readGenericAttachment(attachmentId);
+    return {
+      __raw: true,
+      status: 200,
+      mediaType: 'application/octet-stream',
+      data: stored.data,
+    };
+  }
+
   /** 判断请求是否来自本机（用于 /api/pairing-code） */
   function isLoopback(request) {
     const address = request.socket !== null && request.socket !== undefined ? request.socket.remoteAddress : '';
@@ -316,6 +344,24 @@ export function createHttpHandler(deps) {
         tokens.verify(token, clientIp(request));
       }
       const result = await route.handler(params, request, url.searchParams);
+      // 流式文件响应（视频等）：交给 send 处理 Range / 条件请求 / MIME
+      if (result !== null && typeof result === 'object' && result.__stream === true) {
+        response.setHeader('Cache-Control', 'private, max-age=86400');
+        const stream = send(request, '/' + encodeURIComponent(result.fileName), {
+          root: result.root,
+          index: false,
+          dotfiles: 'deny',
+          acceptRanges: true,
+        });
+        stream.on('error', (streamError) => {
+          if (!response.headersSent) {
+            response.statusCode = streamError.status ?? 500;
+          }
+          response.end();
+        });
+        stream.pipe(response);
+        return;
+      }
       // 原始字节响应（图片等）：不包 JSON，直接写二进制
       if (result !== null && typeof result === 'object' && result.__raw === true) {
         const body = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data ?? []);

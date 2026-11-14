@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh-phone-bridge v3 · 冒烟测试（不依赖 DSH 运行时）
  *
  * 用一个假的 cordis ctx 把插件跑起来，端到端验证：
@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { WebSocket } from 'ws';
 
 import { apply, normalize } from './index.js';
+import { projectEvents } from './adapter/project.js';
 
 // ── 假 DSH 服务 ────────────────────────────────────────────────────────────
 
@@ -270,6 +271,10 @@ async function main() {
   const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-bridge-smoke-'));
   const tokenFile = join(tmpDir, 'tokens.json');
   const runtimeFile = join(tmpDir, 'runtime.json');
+  // 隔离 $DSH_HOME：否则适配层会把偏好模型写进真实的 ~/.dsh/phone-bridge/model.json，
+  // 测试用的假模型（a/b）会污染手机端新建会话。
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = tmpDir;
 
   const ctx = makeFakeCtx();
   const cfg = normalize({ port: 0, host: '127.0.0.1', logLevel: 'silent', tokenFile });
@@ -286,7 +291,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.0.0');
+  assert.equal(health.json.bridgeVersion, '3.0.1');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -397,7 +402,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.0.0');
+  assert.equal(hello.payload.bridgeVersion, '3.0.1');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -473,7 +478,7 @@ async function main() {
   const objectDir = join(attachmentHome, 'attachments', 'v1', 'objects', attachmentHex.slice(0, 2));
   mkdirSync(objectDir, { recursive: true });
   writeFileSync(join(objectDir, attachmentHex), pngBytes);
-  const previousHome = process.env.DSH_HOME;
+  const previousAttachmentHome = process.env.DSH_HOME;
   process.env.DSH_HOME = attachmentHome;
   const imageResponse = await fetch(`http://127.0.0.1:${port}/api/attachments/sha256%3A${attachmentHex}`, {
     headers: { Authorization: `Bearer ${paired.json.token}` },
@@ -487,9 +492,126 @@ async function main() {
   assert.equal(missingImage.json.error.code, 'NOT_SUPPORTED', '不存在的附件应报 NOT_SUPPORTED');
   const badId = await request(port, 'GET', '/api/attachments/not-a-hash', { token: paired.json.token });
   assert.equal(badId.json.error.code, 'INVALID_PARAM', '非法附件 ID 应报 INVALID_PARAM');
-  if (previousHome === undefined) delete process.env.DSH_HOME;
-  else process.env.DSH_HOME = previousHome;
+  if (previousAttachmentHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousAttachmentHome;
   pass('GET /api/attachments/:id 二进制图片');
+
+  // 17b) 媒体文件（AI 生成视频）二进制响应
+  const mediaBytes = Buffer.from('00000018667479706d703432', 'hex');
+  const mediaName = 'smoke-clip.mp4';
+  const mediaHome = mkdtempSync(join(tmpdir(), 'dsh-bridge-media-'));
+  const mediaDir = join(mediaHome, 'dsh-imagegen', 'videos', 'files');
+  mkdirSync(mediaDir, { recursive: true });
+  writeFileSync(join(mediaDir, mediaName), mediaBytes);
+  const previousMediaHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = mediaHome;
+  const mediaResponse = await fetch(`http://127.0.0.1:${port}/api/media/${mediaName}`, {
+    headers: { Authorization: `Bearer ${paired.json.token}` },
+  });
+  const mediaBody = Buffer.from(await mediaResponse.arrayBuffer());
+  assert.equal(mediaResponse.status, 200, '视频应返回 200');
+  assert.equal(mediaResponse.headers.get('content-type'), 'video/mp4', '视频 Content-Type 应为 video/mp4');
+  assert.ok(mediaBody.equals(mediaBytes), '视频字节内容应一致');
+  const missingMedia = await request(port, 'GET', '/api/media/nope.mp4', { token: paired.json.token });
+  assert.equal(missingMedia.json.error.code, 'NOT_SUPPORTED', '不存在的媒体应报 NOT_SUPPORTED');
+  const traversal = await request(port, 'GET', '/api/media/..%2F..%2Fsecret.txt', { token: paired.json.token });
+  assert.equal(traversal.json.error.code, 'INVALID_PARAM', '路径穿越应报 INVALID_PARAM');
+  const rangeResponse = await fetch(`http://127.0.0.1:${port}/api/media/${mediaName}`, {
+    headers: { Authorization: `Bearer ${paired.json.token}`, Range: 'bytes=0-3' },
+  });
+  const rangeBody = Buffer.from(await rangeResponse.arrayBuffer());
+  assert.equal(rangeResponse.status, 206, 'Range 请求应返回 206');
+  assert.equal(rangeBody.length, 4, 'Range 应只返回请求区间字节');
+  assert.ok(rangeBody.equals(mediaBytes.subarray(0, 4)), 'Range 字节应与源文件一致');
+  if (previousMediaHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousMediaHome;
+  pass('GET /api/media/:name 二进制视频');
+
+  // 17c) 通用文件附件（file 块）二进制响应
+  const fileBytes = Buffer.from('DSH-FILE-ATTACHMENT-PAYLOAD', 'utf8');
+  const fileHex = crypto.createHash('sha256').update(fileBytes).digest('hex');
+  const fileHome = mkdtempSync(join(tmpdir(), 'dsh-bridge-file-'));
+  const fileObjectDir = join(fileHome, 'attachments', 'v1', 'file-objects', fileHex.slice(0, 2));
+  mkdirSync(fileObjectDir, { recursive: true });
+  writeFileSync(join(fileObjectDir, fileHex), fileBytes);
+  const previousFileHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = fileHome;
+  const fileResponse = await fetch(`http://127.0.0.1:${port}/api/files/sha256%3A${fileHex}`, {
+    headers: { Authorization: `Bearer ${paired.json.token}` },
+  });
+  const fileBody = Buffer.from(await fileResponse.arrayBuffer());
+  assert.equal(fileResponse.status, 200, '文件附件应返回 200');
+  assert.equal(fileResponse.headers.get('content-type'), 'application/octet-stream', '文件 Content-Type 应为 octet-stream');
+  assert.ok(fileBody.equals(fileBytes), '文件字节内容应一致');
+  const missingFile = await request(port, 'GET', `/api/files/sha256:${'f'.repeat(64)}`, { token: paired.json.token });
+  assert.equal(missingFile.json.error.code, 'NOT_SUPPORTED', '不存在的文件应报 NOT_SUPPORTED');
+  if (previousFileHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousFileHome;
+  pass('GET /api/files/:id 二进制文件');
+
+  // 17d) 投影层：生成类工具的媒体引用 → 可渲染块，本机路径从正文剥离
+  const imageResultText = JSON.stringify({
+    task_id: 't1',
+    status: 'completed',
+    message: 'Generation completed.',
+    files: ['C:\\Users\\x\\.dsh\\dsh-imagegen\\images\\abc-0.png'],
+    images: [{
+      attachment_id: `sha256:${'a'.repeat(64)}`,
+      media_type: 'image/png',
+      bytes: 1234,
+      width: 1024,
+      height: 1024,
+      name: 'abc-1.png',
+    }],
+  });
+  const videoResultText = JSON.stringify({
+    task_id: 't2',
+    status: 'completed',
+    message: 'Video generation completed.',
+    videos: [{ url: '/api/dsh-imagegen/video/file/clip.mp4', mime: 'video/mp4', duration: 5 }],
+  });
+  const projected = projectEvents([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'tool/result',
+      seq: 2,
+      time: 2,
+      data: { turn: 1, step: 1, callId: 'c1', message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: imageResultText }] } },
+    },
+    {
+      type: 'tool/result',
+      seq: 3,
+      time: 3,
+      data: { turn: 1, step: 1, callId: 'c2', message: { role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: videoResultText }] } },
+    },
+    {
+      type: 'assistant/message',
+      seq: 4,
+      time: 4,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '![生成图片](C:\\Users\\x\\.dsh\\dsh-imagegen\\images\\abc-0.png)\n\n生成完成。' }],
+        },
+      },
+    },
+  ]);
+  const imageTool = projected.messages.find((m) => m.seq === 2);
+  const imageBlock = imageTool.blocks.find((b) => b.type === 'image');
+  assert.equal(imageBlock.attachmentId, `sha256:${'a'.repeat(64)}`, '生图结果应补出 image 块');
+  assert.equal(imageTool.text.includes('C:\\Users'), false, '工具正文不应带本机路径');
+  assert.equal(imageTool.text.includes('task_id'), false, '工具正文不应保留原始 JSON');
+  assert.ok(imageTool.text.startsWith('Generation completed.'), '工具正文应换成友好 message');
+  const videoTool = projected.messages.find((m) => m.seq === 3);
+  const videoBlock = videoTool.blocks.find((b) => b.type === 'video');
+  assert.equal(videoBlock.attachmentId, 'media:clip.mp4', '生视频结果应补出 video 块');
+  assert.equal(videoBlock.mediaType, 'video/mp4');
+  const assistant = projected.messages.find((m) => m.seq === 4);
+  assert.equal(assistant.text.includes('C:\\Users'), false, '助手正文不应带本机路径');
+  assert.ok(assistant.text.includes('生成完成'), '助手正文其余内容应保留');
+  pass('生成类工具媒体投影（图片/视频块 + 剥离本机路径）');
 
   // 18) /pair 页面（本机可打开）
   const pairPage = await request(port, 'GET', '/pair');
