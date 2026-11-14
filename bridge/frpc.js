@@ -3,7 +3,7 @@
  *
  * 职责：
  *   1. frpc.toml 生成（官方 frp v0.5x TOML 语法：serverAddr/serverPort/auth.token/
- *      transport.tls.enabled/[[proxies]]，tcp 透传到本机桥端口）
+ *      transport.tls.enable/[[proxies]]，tcp 透传到本机桥端口）
  *   2. frpc.exe 自动引导：写死官方 GitHub releases（fatedier/frp），下载后做
  *      size + sha256 双校验（元数据取自 GitHub release assets API），再从 zip
  *      里抽出 frpc.exe（含 CRC32 校验），校验不过绝不落盘；
@@ -13,7 +13,7 @@
  *
  * frp 参数均为官方文档常识键名，不臆造：
  *   serverAddr / serverPort / auth.method="token" / auth.token /
- *   transport.tls.enabled / [[proxies]] type="tcp" localIP localPort remotePort
+ *   transport.tls.enable / [[proxies]] type="tcp" localIP localPort remotePort
  *
  * token 只写入 frpc.toml（权限 600）与内存；永不进日志 / 状态 / 健康检查。
  */
@@ -73,7 +73,7 @@ export function buildFrpcConfig(cfg) {
     `serverPort = ${serverPort}`,
     'auth.method = "token"',
     `auth.token = "${token.replaceAll('"', '\\"')}"`,
-    `transport.tls.enabled = ${useTls ? 'true' : 'false'}`,
+    `transport.tls.enable = ${useTls ? 'true' : 'false'}`,
     '',
     '[[proxies]]',
     `name = "${proxyName}"`,
