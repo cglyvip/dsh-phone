@@ -1,0 +1,27 @@
+# dsh-phone-bridge 随包默认配置层
+# 包声明 dsh.bundle.patch 指向本文件，安装时作为组合包的 patch 层加载。
+# 注意：profile 的 cordis.patch.yml 只放「按 id 的配置覆盖」，不要再 insert 一次，
+#      否则同一个插件会被加载两遍（详见项目 HANDOVER.md 第 4 节）。
+- insert:
+    - id: phone-bridge
+      name: dsh-phone-bridge
+      config:
+        # 监听地址：0.0.0.0 才能被手机访问；只想本机调试时改成 127.0.0.1
+        host: 0.0.0.0
+        # 端口：被占用会自动 +1 重试，最多试 10 个
+        port: 9000
+        # 鉴权：token（推荐）/ none（仅本机调试，禁止用于发布）
+        authMode: token
+        # 令牌有效期（天）
+        tokenTtlDays: 7
+        # 配对模式：lan（允许局域网配对）/ disabled（关闭配对）
+        pairingMode: lan
+        # 允许的跨域来源（一般留空）
+        allowOrigins: []
+        # 公网地址：填了就以它为准（例如 https://xxx.trycloudflare.com）
+        publicUrl: ''
+        # Cloudflare 快速隧道：off / pair（执行 /pair 时启动）/ startup（启动即开）
+        cloudflareTunnel: off
+        cloudflaredPath: cloudflared
+        # 日志级别：info / silent
+        logLevel: info
