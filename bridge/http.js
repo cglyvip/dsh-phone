@@ -24,7 +24,7 @@ import {
   sendJson,
 } from './errors.js';
 import send from 'send';
-import { TUNNEL_MODES } from './transport.js';
+import { probePublicUrl, TUNNEL_MODES } from './transport.js';
 
 /**
  * 隧道流量的 Host 头标记（与 cloudflare.js 的 TUNNEL_HOST_HEADER 一致）。
@@ -71,6 +71,7 @@ export function createHttpHandler(deps) {
     { method: 'GET', pattern: /^\/api\/pairing-code$/, handler: handlePairingCode, open: true, loopbackOnly: true },
     { method: 'GET', pattern: /^\/api\/transport$/, handler: handleTransportStatus },
     { method: 'POST', pattern: /^\/api\/transport\/mode$/, handler: handleTransportSwitch, loopbackOnly: true },
+    { method: 'POST', pattern: /^\/api\/transport\/probe$/, handler: handleTransportProbe, loopbackOnly: true },
     { method: 'GET', pattern: /^\/api\/sessions$/, handler: handleListSessions },
     { method: 'POST', pattern: /^\/api\/sessions$/, handler: handleCreateSession },
     { method: 'POST', pattern: /^\/api\/sessions\/batch-delete$/, handler: handleBatchDelete },
@@ -166,24 +167,51 @@ export function createHttpHandler(deps) {
   }
 
   /**
-   * POST /api/transport/mode（v3.2 §10，仅本机）：一键切换公网通道，停旧起新。
-   * body: { "mode": "quick" | "named" | "frp" | "relay" | "off" }
-   * 选择持久化到 $DSH_HOME/phone-bridge/transport.json（重启后仍生效）。
+   * POST /api/transport/mode（v3.2 §10 / v3.3 §10.1，仅本机）：一键切换公网通道，停旧起新。
+   * body: { "tunnelMode"|"mode": "quick"|"named"|"frp"|"custom"|"ngrok"|"relay"|"off",
+   *         publicUrl?, frp?, ngrok? }
+   * 切换时可一并写入通道参数并持久化到 transport.json（600）；
+   * frp token / ngrok authtoken 只落盘，不回显到任何响应。
    */
   async function handleTransportSwitch(params, request) {
     if (transport === undefined) {
       throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前版本未启用通道管理');
     }
     const body = await readJsonBody(request);
-    const mode = requireString(body, 'mode').trim();
+    const rawMode = typeof body.tunnelMode === 'string' && body.tunnelMode.trim().length > 0
+      ? body.tunnelMode
+      : (typeof body.mode === 'string' ? body.mode : undefined);
+    if (typeof rawMode !== 'string' || rawMode.trim().length === 0) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 tunnelMode（或兼容别名 mode）');
+    }
+    const mode = rawMode.trim();
     if (!TUNNEL_MODES.includes(mode)) {
       throw new BridgeError(ErrorCode.INVALID_PARAM, `tunnelMode 必须是 ${TUNNEL_MODES.join(' / ')} 之一`);
     }
+    const switchParams = {};
+    if (typeof body.publicUrl === 'string') switchParams.publicUrl = body.publicUrl;
+    if (body.frp !== null && typeof body.frp === 'object') switchParams.frp = body.frp;
+    if (body.ngrok !== null && typeof body.ngrok === 'object') switchParams.ngrok = body.ngrok;
     return transport.switchMode(mode, {
+      ...(Object.keys(switchParams).length > 0 ? { params: switchParams } : {}),
       ...(typeof transportPersistFile === 'string' && transportPersistFile.length > 0
         ? { persistFile: transportPersistFile }
         : {}),
     });
+  }
+
+  /**
+   * POST /api/transport/probe（v3.3 §10.1，仅本机）：探活公网地址。
+   * body: { "url": "https://..." } → 对 <url>/api/health GET 一次（3s 超时）
+   * → { ok, status, latencyMs, error? }。custom 模式粘贴地址后即时验证用。
+   */
+  async function handleTransportProbe(params, request) {
+    if (transport === undefined) {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前版本未启用通道管理');
+    }
+    const body = await readJsonBody(request);
+    const url = requireString(body, 'url');
+    return probePublicUrl(url, { timeoutMs: 3000 });
   }
 
   async function handleListSessions(params, request, query) {

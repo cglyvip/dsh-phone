@@ -20,6 +20,9 @@ import { WebSocket } from 'ws';
 import { apply, normalize } from './index.js';
 import { projectEvents } from './adapter/project.js';
 import { buildFrpcConfig, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
+import { ensureNgrokBinary, extractNgrokFromZip, ngrokReleaseInfo, parseNgrokLine, verifyNgrokAsset } from './bridge/ngrok.js';
+import { probePublicUrl } from './bridge/transport.js';
+import { FRP_PROVIDERS, pairHtml } from './pair.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
@@ -95,6 +98,11 @@ function makeFrpcSpawner({ lines, exitAfterMs = 40 }) {
       };
       spawns.push({ command, args, pid: child.pid });
       queueMicrotask(() => {
+        // ngrok config add-authtoken 是一闪而过的子命令：mock 让它立即以 0 退出
+        if (args[0] === 'config' && args[1] === 'add-authtoken') {
+          child.emit('exit', 0);
+          return;
+        }
         for (const line of lines) child.stdout.emit('data', Buffer.from(`${line}\n`));
         if (exitAfterMs >= 0) {
           const timer = setTimeout(() => {
@@ -488,7 +496,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.2.0');
+  assert.equal(health.json.bridgeVersion, '3.3.0');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -599,7 +607,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.2.0');
+  assert.equal(hello.payload.bridgeVersion, '3.3.0');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -1226,14 +1234,14 @@ async function main() {
   assert.ok(toml.includes('serverPort = 7000'));
   assert.ok(toml.includes('auth.method = "token"'));
   assert.ok(toml.includes(`auth.token = "${frpToken}"`), 'token 必须写进 frpc.toml');
-  assert.ok(toml.includes('transport.tls.enabled = true'));
+  assert.ok(toml.includes('transport.tls.enable = true'));
   assert.ok(toml.includes('localIP = "127.0.0.1"'));
   assert.ok(toml.includes('localPort = 8787'));
   assert.ok(toml.includes('remotePort = 34567'));
   assert.ok(toml.includes('[[proxies]]'));
   const noRemote = buildFrpcConfig({ serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 0, useTls: false, localPort: 8787 }).toml;
   assert.ok(!noRemote.includes('remotePort'), 'remotePort=0 应省略该键（由 frps 分配）');
-  assert.ok(!noRemote.includes('transport.tls.enabled = true'));
+  assert.ok(!noRemote.includes('transport.tls.enable = true'));
   frpLog('生成配置示例');
   const logBlob = frpLogs.join('\n');
   assert.ok(!logBlob.includes(frpToken), 'token 绝不进日志');
@@ -1395,7 +1403,7 @@ async function main() {
   const switchFrp = await transportG.switchMode('frp');
   assert.equal(switchFrp.tunnelMode, 'frp');
   assert.equal(switchFrp.tunnelUrl, 'http://203.0.113.10:34567', 'frp 固定 remotePort 时直接回填');
-  assert.equal(Object.keys(switchFrp.channels).length, 4, '四通道卡片状态齐全');
+  assert.equal(Object.keys(switchFrp.channels).length, 6, '六通道卡片状态齐全（§10.1 含 custom/ngrok）');
   const switchOff = await transportG.switchMode('off');
   assert.equal(switchOff.tunnelStatus, 'off');
   assert.ok(!JSON.stringify(switchOff.channels).includes(frpToken), '通道卡片不携带 token');
@@ -1442,6 +1450,233 @@ async function main() {
   const loopbackOnlySwitch = await request(port, 'POST', '/api/transport/mode', { token });
   assert.equal(loopbackOnlySwitch.status, 400, '缺 mode → 400 INVALID_PARAM');
   pass('HTTP 通道路由（状态查询 / 一键切换 / 持久化 / 非法参数）');
+
+  // 29) v3.3 §10.1：custom 模式（粘贴任意公网地址，不托管进程）
+  const transportCustom = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'custom', publicUrl: 'https://my-abc.oophz.com:12345/' }),
+    home: frpcHomeE,
+    log: frpLog,
+  });
+  await transportCustom.start({ localPort: 8787 });
+  const customStatus = transportCustom.status();
+  assert.equal(customCustom(customStatus), 'https://my-abc.oophz.com:12345');
+  await transportCustom.stop();
+  function customCustom(status) {
+    return status.channels.custom.url;
+  }
+
+  const transportCustomBad = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'custom', publicUrl: 'ftp://不是http' }),
+    home: frpcHomeE,
+    log: frpLog,
+  });
+  await transportCustomBad.start({ localPort: 8787 });
+  assert.equal(transportCustomBad.status().tunnelStatus, 'error', '非 http/https 地址应报错');
+  assert.ok(transportCustomBad.status().channels.custom.error.includes('格式无效'), '错误应说明格式问题');
+  await transportCustomBad.stop();
+
+  const transportCustomEmpty = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'custom', publicUrl: '' }),
+    home: frpcHomeE,
+    log: frpLog,
+  });
+  await transportCustomEmpty.start({ localPort: 8787 });
+  assert.equal(transportCustomEmpty.status().tunnelStatus, 'error', 'custom 缺地址应报错降级');
+  assert.ok(transportCustomEmpty.status().channels.custom.error.includes('公网地址'), '错误应提示先填地址');
+  await transportCustomEmpty.stop();
+  pass('custom 模式（合法地址 running / 非 http 格式拒绝 / 缺地址降级）');
+
+  // 30) v3.3 §10.1：探活接口 probePublicUrl + POST /api/transport/probe
+  const probeOk = await probePublicUrl('http://127.0.0.1:' + port, { timeoutMs: 3000 });
+  assert.equal(probeOk.ok, true, '探活本桥 /api/health 应可达');
+  assert.equal(probeOk.status, 200);
+  assert.ok(Number.isFinite(probeOk.latencyMs) && probeOk.latencyMs >= 0);
+  assert.deepEqual(Object.keys(probeOk).sort(), ['latencyMs', 'ok', 'status'], '结果形状按 TransportProbeResult');
+  const probeDead = await probePublicUrl('http://127.0.0.1:9', { timeoutMs: 1000 });
+  assert.equal(probeDead.ok, false);
+  assert.ok(typeof probeDead.error === 'string' && probeDead.error.length > 0, '不可达应有 error 说明');
+  const probeBad = await probePublicUrl('不是地址', { timeoutMs: 1000 });
+  assert.equal(probeBad.ok, false);
+  assert.ok(probeBad.error.includes('格式无效'));
+  const probeHttp = await request(port, 'POST', '/api/transport/probe', {
+    token,
+    body: { url: 'http://127.0.0.1:' + port },
+  });
+  assert.equal(probeHttp.status, 200);
+  assert.equal(probeHttp.json.ok, true);
+  assert.equal(probeHttp.json.status, 200);
+  const probeHttpBad = await request(port, 'POST', '/api/transport/probe', { token, body: { url: ' nonsense ' } });
+  assert.equal(probeHttpBad.status, 200);
+  assert.equal(probeHttpBad.json.ok, false);
+  assert.ok(probeHttpBad.json.error.includes('格式无效'));
+  const probeNoAuth = await request(port, 'POST', '/api/transport/probe', { body: { url: 'http://127.0.0.1:' + port } });
+  assert.equal(probeNoAuth.status, 401, '探活接口需要令牌');
+  pass('POST /api/transport/probe 探活（本桥 200 / 死端口 error / 非法地址 / 鉴权）');
+
+  // 31) v3.3 §10.1：ngrok 托管（mock 进程：add-authtoken → http --domain → JSON 日志）
+  const ngrokHomeG = mkdtempSync(join(tmpdir(), 'dsh-bridge-ngrok-'));
+  mkdirSync(join(ngrokHomeG, 'phone-bridge', 'ngrok'), { recursive: true });
+  writeFileSync(join(ngrokHomeG, 'phone-bridge', 'ngrok', 'ngrok.exe'), 'USER-NGROK');
+  const ngrokSpawner = makeFrpcSpawner({
+    lines: [
+      '{"lvl":"inf","msg":"starting web service","obj":"web","addr":"127.0.0.1:4040"}',
+      '{"lvl":"inf","msg":"started tunnel","obj":"tunnels","name":"command_line","url":"https://my-bridge.ngrok.app"}',
+    ],
+    exitAfterMs: -1,
+  });
+  const ngrokLogs = [];
+  const transportNgrok = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'ngrok',
+      ngrok: { authtoken: 'ngrok-secret-token-331', staticDomain: 'my-bridge.ngrok.app' },
+    }),
+    home: ngrokHomeG,
+    log: (msg) => { ngrokLogs.push(msg); },
+    spawnImpl: ngrokSpawner.spawnImpl,
+    backoffBaseMs: 20,
+  });
+  await transportNgrok.start({ localPort: 8787 });
+  const ngrokRunning = await waitForCondition(
+    () => transportNgrok.status(),
+    (value) => value.tunnelStatus === 'running',
+    4000,
+    'ngrok 通道 running',
+  );
+  assert.equal(ngrokRunning.tunnelUrl, 'https://my-bridge.ngrok.app');
+  assert.equal(ngrokSpawner.spawns.length, 2, '应先 add-authtoken 再起 http 隧道');
+  assert.deepEqual(ngrokSpawner.spawns[0].args, ['config', 'add-authtoken', 'ngrok-secret-token-331'], '第一条命令按官方 CLI 落 authtoken');
+  assert.deepEqual(ngrokSpawner.spawns[1].args.slice(0, 3), ['http', '8787', '--domain=my-bridge.ngrok.app'], '隧道命令按官方 CLI http --domain');
+  assert.ok(ngrokSpawner.spawns[1].args.includes('--log=stdout'), '日志走 stdout 便于桥解析');
+  const ngrokJson = JSON.stringify(ngrokRunning);
+  assert.ok(!ngrokJson.includes('ngrok-secret-token-331'), 'authtoken 不进状态');
+  assert.ok(!ngrokLogs.join('\n').includes('ngrok-secret-token-331'), 'authtoken 不进日志');
+  await transportNgrok.stop();
+  pass('ngrok 托管（官方 CLI 序列 + started tunnel 解析 + authtoken 不落日志/状态）');
+
+  // 31b) ngrok 崩溃重启（指数退避最多 5 次）+ 缺 authtoken 降级
+  const crashNgrok = makeFrpcSpawner({
+    lines: ['{"lvl":"inf","msg":"started tunnel","obj":"tunnels","url":"https://x.ngrok.app"}'],
+    exitAfterMs: 30,
+  });
+  const transportNgrokCrash = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'ngrok',
+      ngrok: { authtoken: 'tok', staticDomain: 'x.ngrok.app' },
+    }),
+    home: ngrokHomeG,
+    log: (msg) => { ngrokLogs.push(msg); },
+    spawnImpl: crashNgrok.spawnImpl,
+    backoffBaseMs: 20,
+  });
+  await transportNgrokCrash.start({ localPort: 8787 });
+  await waitForCondition(
+    () => transportNgrokCrash.status(),
+    (value) => value.tunnelStatus === 'error' && value.tunnelError.includes('已停止重试'),
+    8000,
+    'ngrok 连续崩溃停止重试',
+  );
+  // 1 次 add-authtoken + 1 次初始 http + 5 次重启
+  assert.equal(crashNgrok.spawns.length, 7, '崩溃重启序列 spawn 次数应为 1+1+5');
+  await transportNgrokCrash.stop();
+
+  const transportNgrokNoAuth = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'ngrok', ngrok: { authtoken: '', staticDomain: 'x.ngrok.app' } }),
+    home: ngrokHomeG,
+    log: (msg) => { ngrokLogs.push(msg); },
+    spawnImpl: makeFrpcSpawner({ lines: [], exitAfterMs: -1 }).spawnImpl,
+  });
+  await transportNgrokNoAuth.start({ localPort: 8787 });
+  const ngrokNoAuthStatus = transportNgrokNoAuth.status();
+  assert.equal(ngrokNoAuthStatus.tunnelStatus, 'error');
+  assert.ok(ngrokNoAuthStatus.channels.ngrok.error.includes('authtoken'), '缺 authtoken 应给出可读错误');
+  await transportNgrokNoAuth.stop();
+  pass('ngrok 崩溃重启策略 + 缺 authtoken 降级');
+
+  // 31c) ngrok 下载双校验与 zip 抽取（与 frp 同构的最小 ZIP）
+  const ngrokPayload = Buffer.from('MOCK-NGROK-EXE-3.3.0', 'utf8');
+  const ngrokZip = makeZip([{ name: 'ngrok.exe', data: ngrokPayload }]);
+  const ngrokExpected = { size: ngrokZip.length, sha256: crypto.createHash('sha256').update(ngrokZip).digest('hex') };
+  assert.equal(verifyNgrokAsset(ngrokZip, ngrokExpected), 'sha256');
+  const tamperedNgrok = Buffer.from(ngrokZip);
+  tamperedNgrok[50] = (tamperedNgrok[50] + 1) % 256;
+  assert.throws(() => verifyNgrokAsset(tamperedNgrok, ngrokExpected), /sha256 不符/, '篡改必须被拒绝');
+  assert.equal(verifyNgrokAsset(ngrokZip, { size: ngrokZip.length, sha256: '' }), 'size', '无 sha256 摘要时按 size 校验（ngrok stable 无官方 checksums 清单）');
+  const extractedNgrok = extractNgrokFromZip(ngrokZip);
+  assert.equal(extractedNgrok.data.toString(), ngrokPayload.toString());
+  const ngrokDirE = join(tmpDir, 'phone-bridge', 'ngrok-e');
+  const ngrokInstall = await ensureNgrokBinary({
+    ngrokDir: ngrokDirE,
+    fetchMeta: async () => ({ size: ngrokZip.length, sha256: ngrokExpected.sha256 }),
+    fetchBuffer: async () => ngrokZip,
+  });
+  assert.equal(ngrokInstall.source, 'managed');
+  assert.equal(readFileSync(ngrokInstall.exePath).toString(), ngrokPayload.toString());
+  assert.equal(parseNgrokLine('{"lvl":"err","msg":"_authentication failed"}').event, 'error', '认证失败行应解析为 error');
+  assert.equal(parseNgrokLine('{"lvl":"inf","msg":"started tunnel","obj":"tunnels","url":"https://a.ngrok.app"}').url, 'https://a.ngrok.app');
+  pass('ngrok 下载双校验 + zip 抽取 + 日志行解析');
+
+  // 32) v3.3 §10.1：frp 服务商预设模板数据完整性（配对页展示层）
+  assert.equal(FRP_PROVIDERS.length, 4);
+  assert.deepEqual(FRP_PROVIDERS.map((provider) => provider.id), ['self', 'openfrp', 'natfrp', 'sunny-ngrok']);
+  for (const provider of FRP_PROVIDERS) {
+    assert.ok(provider.name.length > 0 && provider.url.startsWith('https://'), '每个预设要有名称与官方入口 URL');
+    assert.ok(provider.fields.includes('remotePort'), '字段说明应覆盖 remotePort');
+    assert.ok(provider.notes.length > 0, '每个预设要有注意事项');
+  }
+  assert.ok(FRP_PROVIDERS.find((provider) => provider.id === 'openfrp').notes.includes('面板'), 'OpenFrp 注意事项应提示面板建隧道');
+  const providerRender = pairHtml({
+    lanUrl: 'ws://192.168.1.5:8787',
+    channels: {
+      frp: { label: 'frp', desc: '', status: 'off', url: '', error: '' },
+      custom: { label: '自定义地址', desc: '', status: 'off', url: '', error: '' },
+    },
+    currentChannel: 'off',
+    port: 8787, clients: 0, code: '123456', expiresAt: Date.now() + 60000,
+    bridgeVersion: '3.3.0', contractVersion: 3,
+  });
+  assert.ok(providerRender.includes('服务商预设'), 'frp 卡片应渲染预设折叠区');
+  assert.ok(providerRender.includes('OpenFrp'), '预设区应列出 OpenFrp');
+  assert.ok(providerRender.includes('custom-url'), 'custom 卡片应有地址输入框');
+  assert.ok(providerRender.includes('/api/transport/probe'), 'custom 卡片应有探活按钮');
+  assert.ok(providerRender.includes('ngrok-authtoken'), 'ngrok 卡片应有 authtoken 输入框');
+  pass('frp 服务商预设模板 + 配对页卡片渲染（custom/ngrok 表单齐全）');
+
+  // 33) v3.3 §10.1：HTTP 切换带参数持久化（token/authtoken 只落盘不回显）
+  mkdirSync(join(tmpDir, 'phone-bridge', 'ngrok'), { recursive: true });
+  writeFileSync(join(tmpDir, 'phone-bridge', 'ngrok', 'ngrok.exe'), 'USER-NGROK');
+  const ngrokSwitch = await request(port, 'POST', '/api/transport/mode', {
+    token,
+    body: { tunnelMode: 'ngrok', ngrok: { authtoken: 'http-token-331', staticDomain: 'http-test.ngrok.app' } },
+  });
+  assert.equal(ngrokSwitch.status, 200);
+  assert.equal(ngrokSwitch.json.tunnelMode, 'ngrok');
+  assert.ok(!JSON.stringify(ngrokSwitch.json).includes('http-token-331'), 'authtoken 不回显');
+  const persistedTransport = JSON.parse(readFileSync(join(tmpDir, 'transport.json'), 'utf8'));
+  assert.equal(persistedTransport.tunnelMode, 'ngrok');
+  assert.equal(persistedTransport.ngrok.authtoken, 'http-token-331', 'authtoken 只落 transport.json（600）');
+  assert.equal(persistedTransport.ngrok.staticDomain, 'http-test.ngrok.app');
+  const ngrokHttpStatus = await request(port, 'GET', '/api/transport', { token });
+  assert.ok(!JSON.stringify(ngrokHttpStatus.json).includes('http-token-331'), '通道状态接口不回显 authtoken');
+  const customSwitch = await request(port, 'POST', '/api/transport/mode', {
+    token,
+    body: { tunnelMode: 'custom', publicUrl: 'https://pasted.example.com:9999' },
+  });
+  assert.equal(customSwitch.status, 200);
+  assert.equal(customSwitch.json.channels.custom.status, 'running');
+  assert.equal(customSwitch.json.channels.custom.url, 'https://pasted.example.com:9999');
+  const emptyCustomSwitch = await request(port, 'POST', '/api/transport/mode', {
+    token,
+    body: { tunnelMode: 'custom', publicUrl: '' },
+  });
+  assert.equal(emptyCustomSwitch.status, 200);
+  assert.equal(emptyCustomSwitch.json.channels.custom.status, 'error', 'custom 缺地址 → 降级并在卡片显示错误');
+  const hackerMode = await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'hacker' } });
+  assert.equal(hackerMode.status, 400);
+  await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'off' } });
+  const offStatus = await request(port, 'GET', '/api/transport', { token });
+  assert.equal(offStatus.json.tunnelMode, 'off');
+  pass('HTTP 切换带参数持久化（authtoken 只落盘不回显 / custom 降级 / 非法值拒绝）');
+
 
   console.log(`\n✅ 冒烟测试全部通过（${passed} 项）`);
   cleanup();

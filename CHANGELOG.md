@@ -1,5 +1,45 @@
 ﻿# CHANGELOG
 
+## 3.3.0（2026-11-15）
+
+### 新增（contract §10.1：通道扩展，覆盖市面全部内网穿透）
+
+- **custom 模式**：花生壳 / natapp / cpolar / zrok 等专有工具拿到的地址直接粘贴——
+  桥只存 publicUrl 并校验格式（必须 http/https）+ 探活，不托管任何进程；
+  缺地址/格式非法 → 卡片报错降级局域网
+- **ngrok 托管**（新增 `bridge/ngrok.js`）：
+  - ngrok.exe 自动引导：官方源 dl.ngrok.com（v3 stable，`DSH_NGROK_URL` 可覆盖），
+    size 强制校验 + sha256 尽力校验（`.sha256` 旁车或 `DSH_NGROK_SHA256`；
+    ngrok stable 无官方 checksums 清单，与 frp 的锁定版本策略不同），
+    校验不过绝不落盘；用户手放 `~/.dsh/phone-bridge/ngrok/ngrok.exe` 永远优先
+  - 官方 CLI 序列：`ngrok config add-authtoken <token>`（token 只落
+    transport.json（600），不进日志/状态/health）→
+    `ngrok http <桥端口> --domain=<静态域名> --log=stdout --log-format=json`，
+    解析 started tunnel JSON 行回填 publicUrl；崩溃指数退避重启最多 5 次
+- **探活接口**：`POST /api/transport/probe`（仅本机）`{url}` → 对
+  `<url>/api/health` GET 3s 超时 → `{ok,status,latencyMs,error?}`；
+  custom 粘贴地址后即时验证
+- **transport/mode 载荷扩展**：`{tunnelMode, publicUrl?, frp?, ngrok?}`——切换时
+  一并写入通道参数并持久化到 transport.json；frp token / ngrok authtoken 只落盘
+  不回显；部分参数更新不覆盖未提供字段
+- **配对页升级**：通道卡片左侧色条 + 内联 SVG 图标 + 当前通道高亮描边 +
+  错误红字；frp 卡片「服务商预设」折叠区（自建 frps / OpenFrp / 樱花Frp(natfrp) /
+  Sunny-Ngrok 四模板：字段说明 + 官方入口 URL + 注意事项，纯展示层）；
+  custom 卡片地址输入框 + 探活按钮 + 结果徽标；ngrok 卡片 authtoken/静态域名表单
+- **安全不变**：ngrok 透传保留原 Host（静态域名，非回环），与 frp 同策略——
+  配对码/配对页/通道切换对一切非本机直连 403 ROUTE_LOCAL_ONLY，业务接口 Bearer 放行
+
+### 说明
+
+- `TUNNEL_MODES` 扩展为 7 种：quick/named/frp/custom/ngrok/relay/off；
+  `isTunnelRequest` 语义复核：仅匹配 cloudflared Host 标记，ngrok/custom/frp 来源
+  由「Host 回环」判定天然拒绝本机路由
+- 冒烟测试 56 → **63 项**（custom 模式三种状态、探活接口 5 断言、ngrok 托管
+  CLI 序列/崩溃重启/authtoken 不落日志、下载双校验与 zip 抽取、预设模板数据
+  完整性、HTTP 参数持久化与不回显等；ngrok 用 mock 进程）
+- 包版本与 `BRIDGE_VERSION` 升至 **3.3.0**；`CONTRACT_VERSION` 仍为 3
+
+
 ## 3.2.0（2026-11-14）
 
 ### 新增（contract §10：公网接入多通道，用户自选）

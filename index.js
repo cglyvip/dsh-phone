@@ -55,6 +55,7 @@ export function normalize(config) {
     tunnelMode = 'quick';
   }
   const frp = raw.frp !== null && typeof raw.frp === 'object' ? raw.frp : {};
+  const ngrok = raw.ngrok !== null && typeof raw.ngrok === 'object' ? raw.ngrok : {};
   const relay = raw.relay !== null && typeof raw.relay === 'object' ? raw.relay : {};
   return {
     enabled: raw.enabled !== false,
@@ -76,6 +77,10 @@ export function normalize(config) {
       token: typeof frp.token === 'string' ? frp.token : '',
       remotePort: Number.isInteger(frp.remotePort) && frp.remotePort >= 0 ? frp.remotePort : 0,
       useTls: frp.useTls === true,
+    },
+    ngrok: {
+      authtoken: typeof ngrok.authtoken === 'string' ? ngrok.authtoken : '',
+      staticDomain: typeof ngrok.staticDomain === 'string' ? ngrok.staticDomain : '',
     },
     relay: {
       endpoint: typeof relay.endpoint === 'string' ? relay.endpoint : '',

@@ -24,8 +24,9 @@ import {
   parseFrpcLine,
   writeFrpcConfig,
 } from './frpc.js';
+import { NgrokChannel, ensureNgrokBinary, ngrokHomeDir } from './ngrok.js';
 
-export const TUNNEL_MODES = ['quick', 'named', 'frp', 'relay', 'off'];
+export const TUNNEL_MODES = ['quick', 'named', 'frp', 'custom', 'ngrok', 'relay', 'off'];
 
 const MAX_FRP_RESTARTS = 5;
 const FRP_BACKOFF_BASE_MS = 1000;
@@ -35,6 +36,7 @@ export function normalizeTransportConfig(config) {
   const raw = config !== null && typeof config === 'object' ? config : {};
   const mode = TUNNEL_MODES.includes(raw.tunnelMode) ? raw.tunnelMode : 'off';
   const frp = raw.frp !== null && typeof raw.frp === 'object' ? raw.frp : {};
+  const ngrok = raw.ngrok !== null && typeof raw.ngrok === 'object' ? raw.ngrok : {};
   const relay = raw.relay !== null && typeof raw.relay === 'object' ? raw.relay : {};
   return {
     tunnelMode: mode,
@@ -49,17 +51,24 @@ export function normalizeTransportConfig(config) {
       remotePort: Number.isInteger(frp.remotePort) && frp.remotePort >= 0 ? frp.remotePort : 0,
       useTls: frp.useTls === true,
     },
+    // v3.3 §10.1 ngrok 托管：authtoken 只落 transport.json（600），不回显
+    ngrok: {
+      authtoken: typeof ngrok.authtoken === 'string' ? ngrok.authtoken.trim() : '',
+      staticDomain: typeof ngrok.staticDomain === 'string' ? ngrok.staticDomain.trim() : '',
+    },
     relay: {
       endpoint: typeof relay.endpoint === 'string' ? relay.endpoint.trim() : '',
     },
   };
 }
 
-/** 通道卡片静态文案（选型建议按 contract §10）。 */
+/** 通道卡片静态文案（选型建议按 contract §10 / §10.1）。 */
 export const CHANNEL_LABELS = {
   quick: { label: 'Cloudflare 快速隧道', desc: '免费试用，地址重启会变' },
   named: { label: 'Cloudflare 命名隧道', desc: '固定域名，免费免维护（需在 CF 后台配置）' },
-  frp: { label: 'frp 自有 VPS', desc: '直连长连接，国内 VPS 延迟最低、最稳' },
+  frp: { label: 'frp（自建 VPS / OpenFrp / 樱花Frp / Sunny-Ngrok）', desc: 'frp 协议服务商通用；直连长连接，国内 VPS 延迟最低' },
+  custom: { label: '自定义地址', desc: '花生壳 / natapp / cpolar / zrok 等任意工具，粘贴公网地址即可' },
+  ngrok: { label: 'ngrok 官方（免费静态域名）', desc: '填 authtoken + 静态域名，桥自动托管 ngrok.exe' },
   relay: { label: '商业中转（订阅）', desc: '下一阶段开放，敬请期待' },
   off: { label: '仅局域网', desc: '手机与电脑同一 Wi-Fi 时使用' },
 };
@@ -233,6 +242,7 @@ export class TransportManager {
    *   spawnImpl?: (command: string, args: string[], options: object) => import('node:child_process').ChildProcess,
    *   fetchJson?: (url: string) => Promise<any>,
    *   fetchBuffer?: (url: string) => Promise<Buffer>,
+   *   fetchMeta?: (url: string) => Promise<{ size: number, sha256?: string }>,
    *   backoffBaseMs?: number,
    * }} deps
    */
@@ -244,6 +254,7 @@ export class TransportManager {
     this.spawnImpl = deps.spawnImpl;
     this.fetchJson = deps.fetchJson;
     this.fetchBuffer = deps.fetchBuffer;
+    this.fetchMeta = deps.fetchMeta;
     this.backoffBaseMs = deps.backoffBaseMs;
     this.localPort = 0;
     this.channel = null;      // 当前通道实例：统一有 snapshot()，进程型通道另有 stop()
@@ -290,6 +301,64 @@ export class TransportManager {
           : { status: 'reserved', url: '', error: '订阅中转服务下一阶段开放（本版仅占位展示）' },
         stop: async () => {},
       };
+      return;
+    }
+    if (mode === 'custom') {
+      // v3.3 §10.1：用户粘贴任意公网地址（花生壳/natapp/cpolar/zrok 等专有工具拿到的），
+      // 桥只存 publicUrl 并探活，不托管任何进程。
+      const url = this.cfg.publicUrl;
+      if (url.length === 0) {
+        this.channel = {
+          snapshot: () => ({
+            status: 'error',
+            url: '',
+            error: 'custom 模式需要先填写公网地址（花生壳/natapp/cpolar/zrok 等工具给出的 http/https 地址）——已降级局域网',
+          }),
+          stop: async () => {},
+        };
+        return;
+      }
+      const parsed = parsePublicUrl(url);
+      if (parsed === null) {
+        this.channel = {
+          snapshot: () => ({
+            status: 'error',
+            url,
+            error: '地址格式无效：必须是 http:// 或 https:// 开头的完整公网地址——已降级局域网',
+          }),
+          stop: async () => {},
+        };
+        return;
+      }
+      this.channel = {
+        snapshot: () => ({ status: 'running', url: parsed, error: '' }),
+        stop: async () => {},
+      };
+      this.log(`custom 通道就绪：${parsed}（可随时用 POST /api/transport/probe 探活）`);
+      return;
+    }
+    if (mode === 'ngrok') {
+      const channel = new NgrokChannel({
+        cfg: this.cfg.ngrok,
+        home: this.home,
+        localPort: this.localPort,
+        log: this.log,
+        ...(this.spawnImpl !== undefined ? { spawnImpl: this.spawnImpl } : {}),
+        ...(this.fetchMeta !== undefined ? { fetchMeta: this.fetchMeta } : {}),
+        ...(this.fetchBuffer !== undefined ? { fetchBuffer: this.fetchBuffer } : {}),
+        ...(this.backoffBaseMs !== undefined ? { backoffBaseMs: this.backoffBaseMs } : {}),
+      });
+      this.channel = channel;
+      try {
+        await channel.start();
+      } catch (error) {
+        this.channel = {
+          snapshot: () => ({ status: 'error', url: '', error: `ngrok 通道启动失败：${error instanceof Error ? error.message : String(error)}（已降级局域网）`, binary: 'none', restarts: 0 }),
+          stop: async () => {},
+        };
+        this.log(`ngrok 通道启动失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.notify();
       return;
     }
     if (mode === 'quick') {
@@ -384,13 +453,25 @@ export class TransportManager {
   }
 
   /**
-   * 切换通道：停旧起新，并把选择持久化（transport.json 只存 tunnelMode）。
+   * 切换通道：停旧起新，并把选择与通道参数持久化（contract §10.1）。
+   * transport.json 含 frp token / ngrok authtoken（权限 600），只落盘不回显。
    * @param {string} mode
-   * @param {{ persistFile?: string }} [options]
+   * @param {{ persistFile?: string, params?: { publicUrl?: string, frp?: object, ngrok?: object } }} [options]
    */
   async switchMode(mode, options = {}) {
     if (!TUNNEL_MODES.includes(mode)) {
       throw new Error(`tunnelMode 必须是 ${TUNNEL_MODES.join(' / ')} 之一`);
+    }
+    // 切换时可一并写入通道参数（§10.1）：先归一化再生效，保证非法值被清成默认
+    const params = options.params !== null && typeof options.params === 'object' ? options.params : null;
+    if (params !== null) {
+      if (typeof params.publicUrl === 'string') this.cfg.publicUrl = params.publicUrl.trim();
+      if (params.frp !== null && typeof params.frp === 'object') {
+        this.cfg.frp = normalizeTransportConfig({ frp: params.frp }).frp;
+      }
+      if (params.ngrok !== null && typeof params.ngrok === 'object') {
+        this.cfg.ngrok = normalizeTransportConfig({ ngrok: params.ngrok }).ngrok;
+      }
     }
     this.log(`切换公网通道：${this.cfg.tunnelMode} → ${mode}`);
     await this.stopChannel();
@@ -399,7 +480,14 @@ export class TransportManager {
     if (persistFile.length > 0) {
       try {
         const fs = await import('node:fs');
-        fs.writeFileSync(persistFile, `${JSON.stringify({ tunnelMode: mode }, null, 2)}\n`, 'utf8');
+        // 持久化完整通道参数：frp token / ngrok authtoken 只落这里（600），不回显到任何响应
+        const persistPayload = {
+          tunnelMode: mode,
+          publicUrl: this.cfg.publicUrl,
+          frp: this.cfg.frp,
+          ngrok: this.cfg.ngrok,
+        };
+        fs.writeFileSync(persistFile, `${JSON.stringify(persistPayload, null, 2)}\n`, 'utf8');
         try {
           fs.chmodSync(persistFile, 0o600);
         } catch {
@@ -418,12 +506,14 @@ export class TransportManager {
     await this.stopChannel();
   }
 
-  /** 状态快照：全部进 /api/health 与配对页。 */
+  /** 状态快照：全部进 /api/health 与配对页（不含任何 token/authtoken）。 */
   status() {
     const channels = {
       quick: { id: 'quick', ...CHANNEL_LABELS.quick, status: 'off', url: '', error: '' },
       named: { id: 'named', ...CHANNEL_LABELS.named, status: 'off', url: this.cfg.publicUrl, error: '' },
       frp: { id: 'frp', ...CHANNEL_LABELS.frp, status: 'off', url: '', error: '', binary: 'none', restarts: 0 },
+      custom: { id: 'custom', ...CHANNEL_LABELS.custom, status: 'off', url: this.cfg.publicUrl, error: '' },
+      ngrok: { id: 'ngrok', ...CHANNEL_LABELS.ngrok, status: 'off', url: '', error: '', binary: 'none', restarts: 0 },
       relay: { id: 'relay', ...CHANNEL_LABELS.relay, status: 'reserved', url: this.cfg.relay.endpoint, error: '' },
     };
     let tunnelStatus = 'off';
@@ -436,8 +526,9 @@ export class TransportManager {
       tunnelUrl = snap.url;
       tunnelError = snap.error;
     }
-    // named 的展示地址兜底用配置里的 publicUrl
-    if (this.cfg.tunnelMode === 'named' && tunnelUrl.length === 0 && this.cfg.publicUrl.length > 0) {
+    // named/custom 的展示地址兜底用配置里的 publicUrl
+    if ((this.cfg.tunnelMode === 'named' || this.cfg.tunnelMode === 'custom')
+      && tunnelUrl.length === 0 && this.cfg.publicUrl.length > 0) {
       tunnelUrl = this.cfg.publicUrl;
     }
     return {
@@ -461,3 +552,62 @@ export class TransportManager {
 }
 
 export default TransportManager;
+
+/**
+ * 校验并归一化一个公网地址（custom 模式 / 探活共用）。
+ * 必须是 http:// 或 https:// 开头的完整 URL；返回去掉尾部斜杠的规范化地址，非法返回 null。
+ */
+export function parsePublicUrl(url) {
+  const text = typeof url === 'string' ? url.trim() : '';
+  if (text.length === 0) return null;
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (parsed.hostname.length === 0) return null;
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`.replace(/\/+$/, '');
+}
+
+/**
+ * 探活一个公网地址（contract §10.1）：GET <url>/api/health，3 秒超时。
+ * custom 模式粘贴地址后的即时验证用；不跟随业务语义，只看 HTTP 状态可达性。
+ * @param {string} url 公网地址（http/https）
+ * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number }} [options]
+ * @returns {Promise<{ok: boolean, status: number, latencyMs: number, error?: string}>}
+ */
+export async function probePublicUrl(url, options = {}) {
+  const started = Date.now();
+  const normalized = parsePublicUrl(url);
+  const latencyMs = () => Date.now() - started;
+  if (normalized === null) {
+    return { ok: false, status: 0, latencyMs: latencyMs(), error: '地址格式无效：必须是 http:// 或 https:// 开头的完整 URL' };
+  }
+  const target = `${normalized}/api/health`;
+  const timeoutMs = Number.isInteger(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 3000;
+  const doFetch = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch;
+  try {
+    const response = await doFetch(target, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 'User-Agent': 'dsh-phone-bridge-probe' },
+    });
+    // 读完 body 避免连接悬挂（状态码即结论，不关心内容）
+    await response.arrayBuffer().catch(() => {});
+    const ok = response.status >= 200 && response.status < 300;
+    return {
+      ok,
+      status: response.status,
+      latencyMs: latencyMs(),
+      ...(ok ? {} : { error: `目标返回 HTTP ${response.status}——地址可达，但 /api/health 不正常（确认地址指向本桥）` }),
+    };
+  } catch (error) {
+    const message = error instanceof Error
+      ? (error.name === 'TimeoutError' || error.name === 'AbortError' ? `探活超时（${timeoutMs}ms）` : error.message)
+      : String(error);
+    return { ok: false, status: 0, latencyMs: latencyMs(), error: message };
+  }
+}
