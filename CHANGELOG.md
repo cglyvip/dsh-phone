@@ -1,5 +1,69 @@
 ﻿# CHANGELOG
 
+## 3.1.0（2026-11-14）
+
+### 新增
+
+- **上传附件**：`POST /api/uploads`（contract §9.1）——原始字节流（Content-Length 已知），
+  `X-File-Name`（URL 编码）+ `X-Media-Type` 头；边收边落临时文件并计算 sha256，
+  单文件上限 **200 MB**（超限 `413 INVALID_PARAM`，Content-Length 预检 + 流式计数双保险）。
+  对象按内容寻址写入 DSH 附件存储：`image/*` → `attachments/v1/objects/<hex前2>/<hex>`、
+  其余 → `attachments/v1/file-objects/<hex前2>/<hex>`（与 DSH 自带发布器一致，同字节重传幂等复用）；
+  PNG/JPEG 魔数解析宽高（GIF/WebP 识别类型、宽高 0），`kind` = image | video | file
+- **带附件发消息**：REST `POST /api/sessions/:id/messages` 与 WS `send` 载荷新增 `attachments`
+  （≤9 个，contract §9.2）——`image/*` → `{type:'image', attachment:{attachmentId, mediaType,
+  bytes, width, height, name}}`（mediaType/bytes/宽高以落盘对象实测为准，保证 DSH
+  readImageFile 逐字段校验通过）；`video/*` 与其他文件 → 先经 DSH 官方
+  `fileUploads.uploadStream` 暂存收据再以 `{type:'file', receiptId}` 进 prompt
+  （DSH 的 resolvePromptFileReceipts 只认收据，直接给 attachment 引用会被拒），
+  会话日志里的 file 块仍是 `{type:'file', attachment:{...}}`；附件块全部拼在 text 之前，
+  空文本 + 附件的纯附件消息允许；未上传过的 attachmentId → `404 INVALID_PARAM`
+- **归档会话删除**：`DELETE /api/sessions/:id?purge=true` 与
+  `POST /api/sessions/batch-delete`（≤200 个，部分成功返回 200，purged / archivedFallback /
+  failed 三数组齐全，contract §9.3）。
+  **DSH 删除能力核实结论**（app.asar 源码）：`SessionPersistence` 只有
+  create/open/flush/stat/list（append-only 语义写死）、`SessionStore` 的 disposal 仅由
+  创建方 fiber 内部 detach 触发、`workspaceController` 只有归档/置顶（其 delete 是删工作区）、
+  全源码无 purge 入口 —— **DSH 0.2.x 无对外会话硬删能力**，因此 purge 一律降级为
+  「归档 + 尽力清标题」，结果放 `archivedFallback` 如实上报，绝不假装删成功；
+  v3.0 的 DELETE（不带 purge）语义不变（仍 = 归档）
+
+### 新增（v3.1 追加）
+
+- **会话权限模式**（contract §9.5）：`GET /api/sessions/:id/permission` 与
+  `PUT /api/sessions/:id/permission`，3 档 `read-only` / `workspace-write` / `full-access`
+  + `approval`（'ask'→every-step / 'never'→auto，只读返回）。
+  **DSH 运行时写入口已核实**：`permissionPresets.set(session, preset)`
+  （dsh-permission-presets/src/index.ts:395-411，ds-bot 即如此使用，见
+  ds-bot/src/host/permissions.js:28）；默认预设表只有 workspace-write 与
+  danger-full-access（index.ts:183-190），因此 full-access → 预设
+  danger-full-access，read-only（默认表没有）→ 直写官方
+  `sandbox/mode` 事件（`session.append('sandbox/mode', {mode})`，
+  dsh-sandbox-policy/src/session-mode.ts:53-54 "THE write path ... the switch
+  IS its event"，SANDBOX_MODES 含 read-only）。PUT 成功后广播 `session.updated`
+- **隧道安全修复**：Quick Tunnel 启动加 `--http-host-header dsh-phone-bridge-tunnel`
+  （cloudflare.js），桥据此识别隧道来源 —— `/api/pairing-code` 与 `/pair` 页对
+  隧道流量一律 `403 ROUTE_LOCAL_ONLY`（新错误码）。此前隧道流量从 127.0.0.1 连入，
+  socket 层面与本机无法区分，**外网可凭隧道地址自助拿配对码**（实测复现的漏洞）。
+  `/api/pair` 保留隧道可达（外地合法配对路径），但加防爆破：同源连续错
+  **20 次**锁 **15 分钟**（`429 RATE_LIMITED` + retryAfter）
+
+### 修复
+
+- **资源不存在误报 501**：`GET /api/media/:name`、`GET /api/attachments/:id`、
+  `GET /api/files/:id` 在对象缺失时返回 `NOT_SUPPORTED(501)`，语义应为 404。
+  新增错误码 `MEDIA_NOT_FOUND(404)` 与 `ATTACHMENT_NOT_FOUND(404)`
+  （contract §5 错误表同步）；发消息时引用未上传附件保持契约规定的 `404 INVALID_PARAM`
+- `GET /api/attachments/:id` / `/api/media/:name` / `/api/files/:id` 的
+  `?token=` 查询参数鉴权经实测确认可用（手机 Image/Video 组件带不了 Authorization 头）
+
+### 说明
+
+- 冒烟测试 27 → **48 项**（上传幂等、PNG/JPEG 尺寸魔数、413、image/file 块结构、
+  fileUploads 收据、未上传 404、>9 附件、纯附件消息、WS 附件、purge 降级、
+  batch 部分成功、超 200 批量上限、隧道 403、pair 防爆破、权限模式读写等）
+- 包版本与 `BRIDGE_VERSION` 升至 `3.1.0`；`CONTRACT_VERSION` 仍为 3（纯增量）
+
 ## 3.0.1（2026-11-14）
 
 ### 新增

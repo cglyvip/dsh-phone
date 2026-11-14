@@ -4,11 +4,20 @@
  * 参考 hdsh-remote-pair (MIT)：/pair 需要公网地址时临时拉起
  * `cloudflared tunnel --url http://127.0.0.1:<桥端口>`，解析出
  * `https://xxx.trycloudflare.com` 后交给配对链接与二维码使用。
+ *
+ * 安全（v3.1）：启动隧道时加 `--http-host-header dsh-phone-bridge-tunnel`，
+ * cloudflared 会把发往源站的每个请求 Host 头改写为该标记。桥侧据此识别
+ * 「隧道来源」：loopback-only 接口（/api/pairing-code、/pair）对隧道流量
+ * 一律 403 —— 否则隧道流量从 127.0.0.1 连入，socket 层面无法与本机用户区分，
+ * 外网用户就能自助拿配对码。本机直连/局域网的 Host 是 IP:端口，判别 100% 可靠。
  */
 import { spawn } from 'node:child_process';
 
 const URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi;
 const DEFAULT_TIMEOUT_MS = 60000;
+
+/** 隧道流量的 Host 头标记（bridge/http.js 的 isTunnelRequest 用同一常量值）。 */
+export const TUNNEL_HOST_HEADER = 'dsh-phone-bridge-tunnel';
 
 function tail(text, max = 1600) {
   const value = String(text ?? '').trim();
@@ -27,7 +36,9 @@ export function startQuickTunnel(options) {
   const targetHost = typeof options.targetHost === 'string' && options.targetHost.length > 0
     ? options.targetHost
     : '127.0.0.1';
-  const displayHost = targetHost.includes(':') ? `[${targetHost}]` : targetHost;
+  // 防御：调用方若误传带协议头的地址（如 http://127.0.0.1），剥掉 scheme 再包 IPv6 括号
+  const cleanHost = targetHost.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  const displayHost = cleanHost.includes(':') ? `[${cleanHost}]` : cleanHost;
   const target = `http://${displayHost}:${bridgePort}`;
   const command = typeof options.command === 'string' && options.command.trim().length > 0
     ? options.command.trim()
@@ -38,12 +49,16 @@ export function startQuickTunnel(options) {
   const log = typeof options.log === 'function' ? options.log : () => {};
   const onExit = typeof options.onExit === 'function' ? options.onExit : () => {};
 
-  log(`正在启动 Cloudflare 隧道：${command} tunnel --url ${target}`);
+  log(`正在启动 Cloudflare 隧道：${command} tunnel --http-host-header ${TUNNEL_HOST_HEADER} --url ${target}`);
 
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, ['tunnel', '--url', target], {
+      child = spawn(command, [
+        'tunnel',
+        '--http-host-header', TUNNEL_HOST_HEADER,
+        '--url', target,
+      ], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

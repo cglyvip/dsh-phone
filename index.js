@@ -178,6 +178,14 @@ export function apply(ctx, config) {
           ? request.socket.remoteAddress
           : '';
         const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+        // 隧道流量（cloudflared --http-host-header 改写 Host）从 127.0.0.1 连入，
+        // socket 层面与本机无法区分；配对页展示配对码，绝不允许隧道访问。
+        const host = typeof request.headers.host === 'string' ? request.headers.host.trim().toLowerCase() : '';
+        const isTunnel = host === 'dsh-phone-bridge-tunnel';
+        if (isTunnel) {
+          sendText(response, 403, '配对页不允许通过公网隧道访问');
+          return;
+        }
         if (!isLoopback) {
           sendText(response, 403, '配对页只允许在电脑本机打开');
           return;
@@ -251,7 +259,7 @@ export function apply(ctx, config) {
         }
 
         if (cfg.cloudflareTunnel === 'startup') {
-          void ensureTunnel();
+          void ensureTunnel().catch(() => { /* 隧道失败已在内部记日志，不致命 */ });
         }
       } catch (error) {
         log(`启动失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -262,7 +270,7 @@ export function apply(ctx, config) {
       if (state.tunnelPromise !== null) return state.tunnelPromise;
       state.tunnelPromise = startQuickTunnel({
         bridgePort: state.port,
-        targetHost: 'http://127.0.0.1',
+        targetHost: '127.0.0.1',
         command: cfg.cloudflaredPath,
         timeoutMs: 60_000,
         log,

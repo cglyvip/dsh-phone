@@ -221,6 +221,7 @@ export class WsDataPlane {
         const result = await this.adapter.prompt({
           sessionId,
           text,
+          attachments: Array.isArray(message.attachments) ? message.attachments : undefined,
           requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
           clientMessageId: typeof message.clientMessageId === 'string' ? message.clientMessageId : undefined,
           mode: typeof message.mode === 'string' ? message.mode : undefined,

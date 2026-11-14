@@ -14,11 +14,46 @@
 
 import { BridgeError, ErrorCode, asBridgeError } from '../bridge/errors.js';
 import { pageByTurns, projectEvents } from './project.js';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 const MAX_DIR_ENTRIES = 500;
+
+/** v3.1：单文件上传上限（contract.md §9.1）。 */
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+/** v3.1：单条消息附件上限（contract.md §9.2）。 */
+const MAX_ATTACHMENTS_PER_MESSAGE = 9;
+
+/** v3.1：批量硬删一次最多处理的会话数（contract.md §9.3）。 */
+const MAX_BATCH_DELETE = 200;
+
+/**
+ * v3.1 §9.5 会话权限 3 档 ↔ DSH 旋钮值的映射。
+ * [官方源码] SANDBOX_MODES = ['read-only','workspace-write','danger-full-access']
+ * （dsh-sandbox-policy/src/session-mode.ts:44）；
+ * approval 只有 'ask' | 'never'（dsh-user-approval/src/index.ts:119）。
+ * 契约的 full-access ↔ DSH 的 danger-full-access（同一档位，叫法不同）。
+ */
+const PERMISSION_MODES = ['read-only', 'workspace-write', 'full-access'];
+const MODE_TO_SANDBOX = {
+  'read-only': 'read-only',
+  'workspace-write': 'workspace-write',
+  'full-access': 'danger-full-access',
+};
+const SANDBOX_TO_MODE = {
+  'read-only': 'read-only',
+  'workspace-write': 'workspace-write',
+  'danger-full-access': 'full-access',
+};
+const APPROVAL_TO_WIRE = { ask: 'every-step', never: 'auto' };
+
+/** 附件对象文件头探测时最多读取的字节数（JPEG SOF 通常在几十 KB 内）。 */
+const IMAGE_HEAD_BYTES = 256 * 1024;
 
 /** 安全的 home 目录（取不到就返回空串，不抛）。 */
 function safeHomedir() {
@@ -79,6 +114,99 @@ function guessImageMediaType(hex, data) {
       && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) return 'image/webp';
   }
   return 'image/png';
+}
+
+/** 解析 PNG 头部里的宽高（IHDR 块固定紧跟签名）。拿不到返回 null，不抛。 */
+function parsePngDimensions(head) {
+  if (head === undefined || head.length < 24) return null;
+  const isPng = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47
+    && head[4] === 0x0d && head[5] === 0x0a && head[6] === 0x1a && head[7] === 0x0a;
+  if (!isPng) return null;
+  const isIhdr = head[12] === 0x49 && head[13] === 0x48 && head[14] === 0x44 && head[15] === 0x52;
+  if (!isIhdr) return null;
+  const width = head.readUInt32BE(16);
+  const height = head.readUInt32BE(20);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
+/**
+ * 解析 JPEG SOFn 段里的宽高（逐段走 marker，最多扫文件头 IMAGE_HEAD_BYTES）。
+ * 拿不到（SOF 超出扫描窗口 / 数据异常）返回 null，不抛。
+ */
+function parseJpegDimensions(head) {
+  if (head === undefined || head.length < 4 || head[0] !== 0xff || head[1] !== 0xd8) return null;
+  let offset = 2;
+  while (offset + 4 <= head.length) {
+    if (head[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    let cursor = offset + 1;
+    while (cursor < head.length && head[cursor] === 0xff) cursor += 1;
+    if (cursor >= head.length) return null;
+    const marker = head[cursor];
+    // 填充 / 独立 marker：继续走
+    if (marker === 0x00 || marker === 0xff || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      offset = cursor + 1;
+      continue;
+    }
+    // EOI 或 SOS：尺寸信息必须在扫描数据之前，到这就别再找了
+    if (marker === 0xd9 || marker === 0xda) return null;
+    // SOFn（C0-CF，排除 DHT/JPG/DAC）：[len2][precision1][height2][width2]
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      if (cursor + 8 > head.length) return null;
+      const height = head.readUInt16BE(cursor + 4);
+      const width = head.readUInt16BE(cursor + 6);
+      if (width <= 0 || height <= 0) return null;
+      return { width, height };
+    }
+    const segmentLength = cursor + 3 <= head.length ? head.readUInt16BE(cursor + 1) : 0;
+    if (segmentLength < 2) return null;
+    offset = cursor + 1 + segmentLength;
+  }
+  return null;
+}
+
+/** 读取文件头部若干字节（不足则读到的为准）。 */
+async function readFileHead(file, bytes = IMAGE_HEAD_BYTES) {
+  const handle = await fs.promises.open(file, 'r');
+  try {
+    const buffer = Buffer.alloc(Math.min(bytes, 8 * 1024 * 1024));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * 从字节头识别图片并尽量取宽高。识别不出（非 PNG/JPEG/GIF/WebP）返回 null。
+ * 注意：宽高只对 PNG/JPEG 有值（contract.md §9.1 只要求这两种魔数解析），
+ * 其余图片 mediaType 照常识别，宽高填 0。
+ */
+function sniffImageHead(head) {
+  if (head === undefined || head.length < 8) return null;
+  const mediaType = guessImageMediaType('', head);
+  const png = parsePngDimensions(head);
+  if (png !== null) return { mediaType: 'image/png', width: png.width, height: png.height };
+  const jpeg = parseJpegDimensions(head);
+  if (jpeg !== null) return { mediaType: 'image/jpeg', width: jpeg.width, height: jpeg.height };
+  const isImageMagic = mediaType !== 'image/png' || (head[0] === 0x89 && head[1] === 0x50);
+  return isImageMagic ? { mediaType, width: 0, height: 0 } : null;
+}
+
+/** 解码 X-File-Name（URL 编码），失败时原样返回；顺手剥掉目录成分。 */
+function decodeUploadName(raw) {
+  let name = typeof raw === 'string' ? raw : '';
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    // 保留原始值
+  }
+  name = name.replace(/\\/g, '/').split('/').pop() ?? '';
+  if (name.length > 255) name = name.slice(0, 255);
+  return name;
 }
 
 /**
@@ -243,6 +371,18 @@ export class DshAdapter {
   optional(name) {
     const service = this.ctx.get(name);
     return service === undefined ? undefined : service;
+  }
+
+  /** DSH home 目录（每次调用时取，方便测试隔离 $DSH_HOME）。 */
+  dshHome() {
+    return typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
+      ? process.env.DSH_HOME
+      : path.join(os.homedir(), '.dsh');
+  }
+
+  /** 附件对象根目录：$DSH_HOME/attachments/v1。 */
+  attachmentsRoot() {
+    return path.join(this.dshHome(), 'attachments', 'v1');
   }
 
   // ── 会话列表 ───────────────────────────────────────────────────────────
@@ -550,6 +690,87 @@ export class DshAdapter {
     }
   }
 
+  /**
+   * 硬删一个会话（contract.md §9.3 DELETE ?purge=true）。
+   *
+   * DSH 删除能力核实结论（app.asar 源码，2026-11-14，DSH 0.2.x）：
+   *   - SessionPersistence 抽象服务只有 create/open/flush/stat/list
+   *     （dsh-session-persistence/src/index.ts:144），「append-only、从不重写」是写死的语义；
+   *     具体实现 JsonlSessionPersistence 也没有任何删除方法
+   *     （dsh-session-persistence-jsonl/src/index.ts:291）。
+   *   - SessionStore（sessions 服务）只有 create/prepare/enter/announce/flush/get/list/fork
+   *     （dsh-session/src/index.ts:1144）；session/disposed 仅由创建方 fiber 内部的
+   *     detach 能力触发，外部拿不到。
+   *   - workspaceController 只有 archiveSession/unarchiveSession/pinSession/unpinSession
+   *     等（dsh-api-workspace-controller/src/index.ts:91-191），其 delete 是删工作区，不是会话。
+   *   - session-query-sqlite 的 _deleteSession 是私有方法，只在检索索引对账时清理
+   *     （dsh-session-query-sqlite/src/index.ts:571）。
+   *   - api-session/removed（桥的 session.deleted 推送来源）只在 session/disposed 时发出
+   *     （dsh-api-session-controller/src/index.ts:227-229）；DSH 自带 UI 也没有删除会话入口。
+   *
+   * 结论：DSH 0.2.x 没有对外可用的会话硬删能力。按契约降级：
+   *   归档（stopActivity）+ 尽力清空标题 + 在响应 archivedFallback 里如实上报。
+   *   DSH 明确拒绝空标题（dsh-session-title/src/index.ts:411-421 SessionTitleInvalidError），
+   *   清标题步骤预期失败并被吞掉，仅为前向兼容保留。
+   *
+   * @returns {Promise<{sessionId: string, purged: boolean, archivedFallback: boolean}>}
+   */
+  async purgeSession(sessionId) {
+    try {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      if (id.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 sessionId');
+      }
+      const query = this.require('sessionQuery');
+      const snapshot = await query.readSession(id);
+      if (snapshot === null || typeof snapshot !== 'object') {
+        throw new BridgeError(ErrorCode.SESSION_NOT_FOUND, '会话不存在', { detail: { sessionId: id } });
+      }
+      await this.archiveSession(id, true);
+      try {
+        const controller = this.optional('sessionController');
+        if (controller !== undefined && typeof controller.rename === 'function') {
+          await controller.rename({ sessionId: id, title: '' });
+        }
+      } catch (error) {
+        this.log(`清空会话标题失败（DSH 拒绝空标题，属预期）: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // DSH 无硬删入口：purged 恒为 false，绝不假装删成功。
+      return { sessionId: id, purged: false, archivedFallback: true };
+    } catch (error) {
+      throw asBridgeError(error);
+    }
+  }
+
+  /**
+   * 批量硬删（contract.md §9.3 POST /api/sessions/batch-delete）。
+   * 部分成功返回 200：purged / archivedFallback / failed 三个数组齐全。
+   */
+  async batchDeleteSessions(ids) {
+    if (!Array.isArray(ids)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, 'ids 必须是字符串数组');
+    }
+    if (ids.length > MAX_BATCH_DELETE) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `批量删除一次最多 ${MAX_BATCH_DELETE} 个会话`);
+    }
+    const result = { purged: [], archivedFallback: [], failed: [] };
+    const seen = new Set();
+    for (const raw of ids) {
+      const id = typeof raw === 'string' ? raw.trim() : '';
+      if (id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      try {
+        const outcome = await this.purgeSession(id);
+        if (outcome.purged === true) result.purged.push(id);
+        else result.archivedFallback.push(id);
+      } catch (error) {
+        const bridgeError = asBridgeError(error);
+        result.failed.push({ id, code: bridgeError.code, message: bridgeError.message });
+      }
+    }
+    return result;
+  }
+
   /** 搜索会话。 */
   async search(query) {
     try {
@@ -584,26 +805,174 @@ export class DshAdapter {
   // ── 发消息 / 停止 ──────────────────────────────────────────────────────
 
   /**
+   * 校验并解析手机端发来的附件引用列表（contract.md §9.2）。
+   *
+   * 规则：
+   *   - 最多 9 个，超出报 INVALID_PARAM；
+   *   - attachmentId 必须是 sha256:<64 位 hex>，且对象文件必须已由
+     POST /api/uploads 落盘，找不到报 404 INVALID_PARAM（提示先上传）；
+   *   - image/*（按字节魔数优先判定）→ 图片块，宽高从存储对象重新探测，
+   *     保证与 DSH readImageFile 的严格校验一致（mediaType/bytes/width/height
+   *     必须逐一匹配，见 dsh-attachment-local/src/store.ts readImageFile）；
+   *   - 其余 → 走 DSH 官方的 fileUploads.uploadStream 暂存收据
+   *     （[官方源码] dsh-api-session-controller/src/commands.ts
+   *     resolvePromptFileReceipts：prompt 的 file 块只认 receiptId，
+   *     直接给 attachment 引用会报 session/attachment-invalid FILE_NOT_STAGED）。
+   */
+  async resolveOutgoingAttachments(sessionId, attachments) {
+    if (attachments === undefined || attachments === null) return [];
+    if (!Array.isArray(attachments)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, 'attachments 必须是数组');
+    }
+    if (attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+      throw new BridgeError(
+        ErrorCode.INVALID_PARAM,
+        `单条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`,
+      );
+    }
+    const resolved = [];
+    for (const item of attachments) {
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, 'attachments 元素必须是对象');
+      }
+      const attachmentId = typeof item.attachmentId === 'string' ? item.attachmentId.trim() : '';
+      const hex = attachmentId.startsWith('sha256:') ? attachmentId.slice(7) : attachmentId;
+      if (!/^[0-9a-f]{64}$/i.test(hex)) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, `附件 ID 非法：${attachmentId}`);
+      }
+      const declared = typeof item.mediaType === 'string' ? item.mediaType.trim().toLowerCase() : '';
+      const name = decodeUploadName(typeof item.name === 'string' ? item.name : '');
+
+      // 定位已上传对象：图片在 objects/，其余在 file-objects/；两处都试，防止
+      // 手机端 mediaType 与上传时不一致导致查错目录。
+      const root = this.attachmentsRoot();
+      const candidates = declared.startsWith('image/')
+        ? ['objects', 'file-objects']
+        : ['file-objects', 'objects'];
+      let objectFile = null;
+      for (const dir of candidates) {
+        const file = path.join(root, dir, hex.slice(0, 2), hex);
+        try {
+          const stat = await fs.promises.stat(file);
+          if (stat.isFile()) {
+            objectFile = file;
+            break;
+          }
+        } catch {
+          // 试下一个目录
+        }
+      }
+      if (objectFile === null) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '附件尚未上传，请先调用 POST /api/uploads 上传后再发送', {
+          status: 404,
+          detail: { attachmentId: `sha256:${hex}` },
+        });
+      }
+
+      const stat = await fs.promises.stat(objectFile);
+      const head = await readFileHead(objectFile);
+      const sniff = sniffImageHead(head);
+      const isImage = sniff !== null || declared.startsWith('image/');
+      // 图片块引用必须与存储字节完全一致（DSH 读取时会逐字段校验），所以
+      // mediaType / bytes / width / height 一律以落盘对象实测值为准。
+      resolved.push({
+        attachmentId: `sha256:${hex}`,
+        hex,
+        name,
+        isImage,
+        kind: isImage ? 'image' : (declared.startsWith('video/') ? 'video' : 'file'),
+        objectFile,
+        bytes: stat.size,
+        mediaType: sniff !== null ? sniff.mediaType : (declared.length > 0 ? declared : 'application/octet-stream'),
+        width: sniff !== null ? sniff.width : 0,
+        height: sniff !== null ? sniff.height : 0,
+      });
+    }
+    return resolved;
+  }
+
+  /**
+   * 通过 DSH 官方 fileUploads 服务把一个文件附件暂存为「会话内收据」。
+   * [官方源码] dsh-client-file-upload/src/index.ts uploadStream({sessionId, data, signal?, name?})
+   *   → attachments.saveFileStream（逐字段落盘，file-objects/<hex前2>/<hex> 内容寻址去重）
+   *   → 返回 { receiptId, file }；收据与该会话的 Agent 绑定，prompt 引用后由 Host 退役。
+   */
+  async stageFileReceipt(sessionId, attachment) {
+    const service = this.optional('fileUploads');
+    if (service === undefined || typeof service.uploadStream !== 'function') {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持文件附件（缺少 fileUploads 服务）', {
+        detail: { attachmentId: attachment.attachmentId },
+      });
+    }
+    const stream = fs.createReadStream(attachment.objectFile);
+    const value = await service.uploadStream({
+      sessionId,
+      data: stream,
+      signal: newSignal(60000),
+      ...(attachment.name.length > 0 ? { name: attachment.name } : {}),
+    });
+    const receiptId = value !== null && typeof value === 'object' && typeof value.receiptId === 'string'
+      ? value.receiptId
+      : '';
+    if (receiptId.length === 0) {
+      throw new BridgeError(ErrorCode.DSH_ERROR, 'DSH 未返回文件上传收据', {
+        detail: { attachmentId: attachment.attachmentId },
+      });
+    }
+    return receiptId;
+  }
+
+  /**
    * 把一条用户消息送进 DSH 的 Agent 循环（红线：绝不直连模型）。
    * [官方源码] sessionController.prompt({requestId, sessionId, mode, content, clientTimeZone})
    * 返回 accepted 表示已入队，真正的回复通过 session/event + agent/assistant-stream 推送。
+   *
+   * v3.1：options.attachments（contract.md §9.2）映射为 prompt content 块，
+   * 附件块全部拼在 text 块之前；text 为空但带附件时允许纯附件消息。
    */
   async prompt(options) {
     try {
       const sessionId = typeof options.sessionId === 'string' ? options.sessionId : '';
       const text = typeof options.text === 'string' ? options.text : '';
       if (sessionId.length === 0) throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 sessionId');
-      if (text.length === 0) throw new BridgeError(ErrorCode.INVALID_PARAM, '消息内容为空');
+      const resolvedAttachments = await this.resolveOutgoingAttachments(sessionId, options.attachments);
+      if (text.trim().length === 0 && resolvedAttachments.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '消息内容为空');
+      }
       const controller = this.require('sessionController');
       const requestId = typeof options.requestId === 'string' && options.requestId.length > 0
         ? options.requestId
         : `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const mode = options.mode === 'steer' ? 'steer' : 'queue';
+      const content = [];
+      for (const attachment of resolvedAttachments) {
+        if (attachment.isImage) {
+          content.push({
+            type: 'image',
+            attachment: {
+              attachmentId: attachment.attachmentId,
+              mediaType: attachment.mediaType,
+              bytes: attachment.bytes,
+              width: attachment.width,
+              height: attachment.height,
+              ...(attachment.name.length > 0 ? { name: attachment.name } : {}),
+            },
+          });
+        } else {
+          // video/* 与其他文件：DSH 的 prompt 只接受暂存收据形式的 file 块
+          //（resolvePromptFileReceipts 校验 receiptId），所以这里先暂存再引用。
+          const receiptId = await this.stageFileReceipt(sessionId, attachment);
+          content.push({ type: 'file', receiptId });
+        }
+      }
+      if (text.trim().length > 0) {
+        content.push({ type: 'text', text });
+      }
       const request = {
         requestId,
         sessionId,
         mode,
-        content: [{ type: 'text', text }],
+        content,
         clientTimeZone: typeof options.clientTimeZone === 'string' && options.clientTimeZone.length > 0
           ? options.clientTimeZone
           : 'Asia/Shanghai',
@@ -794,6 +1163,219 @@ export class DshAdapter {
     }
   }
 
+  // ── 会话权限模式（v3.1，contract.md §9.5）──────────────────────────────
+
+  /**
+   * 读一个会话的权限模式。
+   *
+   * 核实结论（app.asar 源码，2026-11-14）：
+   *   - 会话权限由三个 log 旋钮事件承载：`permission/preset` / `sandbox/mode` /
+   *     `approval/policy`（dsh-permission-presets/src/index.ts:133-137 折叠），
+   *     最后一条生效 —— 桥的投影层（adapter/project.js）已经能读到它们。
+   *   - 没有旋钮事件时 = 部署组合默认（ctx.shell.sandboxMode / approval 默认），
+   *     桥读不到 ctx.shell，用 permissionPresets.catalog().defaultPreset 的 spec 折算。
+   *   - approval：DSH 只有 'ask' | 'never'（dsh-user-approval/src/index.ts:119），
+   *     映射 'ask'→'every-step'、'never'→'auto'。
+   *
+   * @returns {Promise<{sessionId: string, mode: string, approval: string}>}
+   */
+  async getPermission(sessionId) {
+    try {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      if (id.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 sessionId');
+      }
+      const query = this.require('sessionQuery');
+      const snapshot = await query.readSession(id);
+      if (snapshot === null || typeof snapshot !== 'object') {
+        throw new BridgeError(ErrorCode.SESSION_NOT_FOUND, '会话不存在', { detail: { sessionId: id } });
+      }
+      const projected = projectEvents(snapshot.events);
+      const catalog = this.readPermissionCatalog();
+      let mode = SANDBOX_TO_MODE[projected.meta.sandbox] ?? '';
+      if (mode.length === 0) {
+        // 无旋钮事件 → 组合默认：活会话走 permissionPresets.current（内部折叠 ctx.shell 默认），
+        // 冷会话退 catalog.defaultPreset。
+        mode = this.currentPermissionModeFromLive(id) ?? this.defaultPermissionMode(catalog);
+      }
+      let approval = APPROVAL_TO_WIRE[projected.meta.approval] ?? '';
+      if (approval.length === 0) {
+        approval = this.defaultApproval(catalog);
+      }
+      return { sessionId: id, mode, approval };
+    } catch (error) {
+      throw asBridgeError(error);
+    }
+  }
+
+  /**
+   * 运行时修改一个会话的权限模式（contract.md §9.5 PUT）。
+   *
+   * 核实到的运行时写入口（全部来自 app.asar 源码）：
+   *   1. permissionPresets.set(session, presetName)（dsh-permission-presets/src/index.ts:395-411）
+   *      —— 官方「THE 写路径」：追加 permission/preset 事件 + setSandboxMode +
+   *      setApprovalPolicy；ds-bot 正是这样改每个 Bot 会话的权限
+   *      （ds-bot/src/host/permissions.js:28 `presets().set(agent.session, wanted)`）。
+   *      默认预设表只有 workspace-write 与 danger-full-access（index.ts:183-190），
+   *      没有默认 read-only 预设（SANDBOX_MODES 里有 read-only，但预设表可由部署配置）。
+   *   2. setSandboxMode(session, mode)（dsh-sandbox-policy/src/session-mode.ts:53-54）
+   *      —— `session.append('sandbox/mode', { mode })`，注释明言
+   *      "THE write path ... the switch IS its event"。SANDBOX_MODES =
+   *      ['read-only','workspace-write','danger-full-access']（session-mode.ts:44）。
+   *      桥作为进程内 cordis 插件，通过 ctx.sessions 拿到活 Session 实例后追加同一事件，
+   *      即是与官方 setter 完全相同的写路径（ds-bot 也跨 fiber 这样用）。
+   *
+   * 策略：catalog 里有 sandbox 匹配的预设 → 走 permissionPresets.set（顺带写 approval）；
+   * 没有（默认部署的 read-only）→ 直写 sandbox/mode 事件。绝不臆造服务方法。
+   *
+   * @returns {Promise<{sessionId: string, mode: string}>}
+   */
+  async setPermission(sessionId, mode) {
+    try {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      if (id.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 sessionId');
+      }
+      if (typeof mode !== 'string' || !PERMISSION_MODES.includes(mode)) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, 'mode 必须是 read-only / workspace-write / full-access 之一');
+      }
+      const query = this.require('sessionQuery');
+      const snapshot = await query.readSession(id);
+      if (snapshot === null || typeof snapshot !== 'object') {
+        throw new BridgeError(ErrorCode.SESSION_NOT_FOUND, '会话不存在', { detail: { sessionId: id } });
+      }
+      const service = this.optional('permissionPresets');
+      if (service === undefined || typeof service.set !== 'function') {
+        throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式（缺少 permissionPresets 服务）');
+      }
+      const live = await this.resolveLiveSession(id);
+      if (live === null) {
+        throw new BridgeError(ErrorCode.DSH_ERROR, '会话未在运行且无法唤起，无法修改权限模式', { detail: { sessionId: id } });
+      }
+      const targetSandbox = MODE_TO_SANDBOX[mode];
+      let presetName = null;
+      const catalog = typeof service.catalog === 'function' ? this.readPermissionCatalog() : null;
+      if (catalog !== null && Array.isArray(catalog.options)) {
+        for (const option of catalog.options) {
+          const value = option !== null && typeof option === 'object' ? option.value : undefined;
+          if (typeof value !== 'string' || value === 'custom' || value === 'auto') continue;
+          try {
+            if (typeof service.resolve === 'function' && service.resolve(value).sandbox === targetSandbox) {
+              presetName = value;
+              break;
+            }
+          } catch {
+            // 目录里不可解析的项跳过
+          }
+        }
+      }
+      if (presetName !== null) {
+        service.set(live, presetName);
+      } else if (typeof live.append === 'function') {
+        live.append('sandbox/mode', { mode: targetSandbox });
+      } else {
+        throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式');
+      }
+      return { sessionId: id, mode };
+    } catch (error) {
+      throw asBridgeError(error);
+    }
+  }
+
+  /**
+   * 读 permissionPresets.catalog()；服务不可用返回 null。
+   * [官方源码] dsh-permission-presets/src/index.ts:291-299 @Remote('catalog')
+   */
+  readPermissionCatalog() {
+    const service = this.optional('permissionPresets');
+    if (service === undefined || typeof service.catalog !== 'function') return null;
+    try {
+      const value = service.catalog();
+      if (value === null || typeof value !== 'object') return null;
+      return {
+        options: Array.isArray(value.options) ? value.options : [],
+        defaultPreset: typeof value.defaultPreset === 'string' ? value.defaultPreset : '',
+      };
+    } catch (error) {
+      this.log(`permissionPresets.catalog 失败: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  /** 从活会话读当前权限模式（permissionPresets.current 折叠组合默认）。拿不到返回 null。 */
+  currentPermissionModeFromLive(sessionId) {
+    const liveStore = this.optional('sessions');
+    const service = this.optional('permissionPresets');
+    if (liveStore === undefined || typeof liveStore.get !== 'function') return null;
+    if (service === undefined || typeof service.current !== 'function') return null;
+    const live = liveStore.get(sessionId);
+    if (live === undefined || live === null) return null;
+    try {
+      const name = service.current(live);
+      if (typeof name !== 'string' || name.length === 0 || name === 'custom' || name === 'auto') return null;
+      const spec = typeof service.resolve === 'function' ? service.resolve(name) : null;
+      if (spec === null || typeof spec !== 'object') return null;
+      return SANDBOX_TO_MODE[spec.sandbox] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** catalog.defaultPreset 折算成 3 档 mode；不可用退 DSH 出厂默认 workspace-write。 */
+  defaultPermissionMode(catalog) {
+    const service = this.optional('permissionPresets');
+    if (catalog !== null && typeof catalog.defaultPreset === 'string' && catalog.defaultPreset.length > 0
+      && service !== undefined && typeof service.resolve === 'function') {
+      try {
+        const spec = service.resolve(catalog.defaultPreset);
+        return SANDBOX_TO_MODE[spec.sandbox] ?? 'workspace-write';
+      } catch {
+        // 退出厂默认
+      }
+    }
+    return 'workspace-write';
+  }
+
+  /** catalog.defaultPreset 折算 approval（ask→every-step / never→auto）；不可用退 every-step。 */
+  defaultApproval(catalog) {
+    const service = this.optional('permissionPresets');
+    if (catalog !== null && typeof catalog.defaultPreset === 'string' && catalog.defaultPreset.length > 0
+      && service !== undefined && typeof service.resolve === 'function') {
+      try {
+        const spec = service.resolve(catalog.defaultPreset);
+        return APPROVAL_TO_WIRE[spec.approval] ?? 'every-step';
+      } catch {
+        // 退出厂默认
+      }
+    }
+    return 'every-step';
+  }
+
+  /**
+   * 解析一个「活着的 Session 实例」：先查 sessions 存储里的活会话，
+   * 没有再用 sessionController.resolveAgent 唤起（官方公开方法，
+   * dsh-api-session-controller/src/index.ts —— "Resolve or resume one ordinary
+   * Session for another Host API domain"）。
+   * @returns {Promise<object|null>} 活 Session 实例；唤起失败返回 null。
+   */
+  async resolveLiveSession(sessionId) {
+    const liveStore = this.optional('sessions');
+    if (liveStore !== undefined && typeof liveStore.get === 'function') {
+      const live = liveStore.get(sessionId);
+      if (live !== undefined && live !== null) return live;
+    }
+    const controller = this.optional('sessionController');
+    if (controller !== undefined && typeof controller.resolveAgent === 'function') {
+      const result = await controller.resolveAgent(sessionId);
+      if (result !== null && typeof result === 'object' && !('error' in result)
+        && result.agent !== null && typeof result.agent === 'object'
+        && result.agent.session !== null && typeof result.agent.session === 'object') {
+        return result.agent.session;
+      }
+    }
+    return null;
+  }
+
   // ── 目录浏览（新建会话选目录用） ───────────────────────────────────────
 
   /**
@@ -880,7 +1462,8 @@ export class DshAdapter {
     try {
       data = await fs.promises.readFile(file);
     } catch {
-      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '图片附件读取失败（对象文件不存在）', {
+      // 路由存在 + 鉴权通过 + 资源不存在 = 404，而不是 501（v3.1 修正，contract.md §5）
+      throw new BridgeError(ErrorCode.ATTACHMENT_NOT_FOUND, '图片附件不存在', {
         detail: { attachmentId: id },
       });
     }
@@ -909,7 +1492,7 @@ export class DshAdapter {
     try {
       data = await fs.promises.readFile(file);
     } catch {
-      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '文件附件不存在', { detail: { attachmentId: id } });
+      throw new BridgeError(ErrorCode.ATTACHMENT_NOT_FOUND, '文件附件不存在', { detail: { attachmentId: id } });
     }
     return { data };
   }
@@ -939,12 +1522,111 @@ export class DshAdapter {
     try {
       stat = await fs.promises.stat(file);
     } catch {
-      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '媒体文件不存在', { detail: { name: fileName } });
+      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在', { detail: { name: fileName } });
     }
     if (stat.isDirectory()) {
       throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
     }
     return { root: path.dirname(file), fileName };
+  }
+
+  // ── 附件上传（v3.1，contract.md §9.1）───────────────────────────────────
+
+  /**
+   * 接收手机端上传的原始字节流并写入 DSH 附件存储（内容寻址、幂等）。
+   *
+   * 存储布局与 DSH 自带实现完全一致（本机实测 + dsh-attachment-local 源码核实）：
+   *   - image/*（按字节魔数判定）→ $DSH_HOME/attachments/v1/objects/<hex前2位>/<hex>
+   *   - 其余 → $DSH_HOME/attachments/v1/file-objects/<hex前2位>/<hex>
+   * DSH 官方发布器（publishImmutableObject）同样是「同摘要已存在即复用」，
+   * 因此这里同字节重传直接复用已有对象，不重复落盘。
+   *
+   * 字节流不整段驻留内存：边收边写临时文件并计算 sha256，超限立即中断，
+   * 完成后原子 rename 到目标位置（rename 失败且目标已存在 = 并发同对象，复用）。
+   *
+   * @param {NodeJS.ReadableStream} source 原始字节流（HTTP request）
+   * @param {{ name?: string, mediaType?: string, contentLength?: unknown }} meta 请求头元信息
+   * @returns {Promise<{attachmentId: string, mediaType: string, name: string, bytes: number, width: number, height: number, kind: string}>}
+   */
+  async saveUpload(source, meta = {}) {
+    const contentLength = Number(meta.contentLength);
+    if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_BYTES) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '附件超过单文件上限 200 MB', { status: 413 });
+    }
+    const declared = typeof meta.mediaType === 'string' ? meta.mediaType.trim().toLowerCase() : '';
+    const name = decodeUploadName(meta.name);
+
+    const tmpDir = path.join(this.attachmentsRoot(), 'tmp');
+    await fs.promises.mkdir(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, `upload-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`);
+    const hash = crypto.createHash('sha256');
+    let bytes = 0;
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        bytes += chunk.length;
+        if (bytes > MAX_UPLOAD_BYTES) {
+          callback(new BridgeError(ErrorCode.INVALID_PARAM, '附件超过单文件上限 200 MB', { status: 413 }));
+          return;
+        }
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    });
+
+    let hex;
+    try {
+      await pipeline(source, counter, fs.createWriteStream(tmpFile));
+      hex = hash.digest('hex');
+    } catch (error) {
+      await fs.promises.rm(tmpFile, { force: true }).catch(() => {});
+      throw asBridgeError(error);
+    }
+    if (!/^[0-9a-f]{64}$/.test(hex)) {
+      await fs.promises.rm(tmpFile, { force: true }).catch(() => {});
+      throw new BridgeError(ErrorCode.INTERNAL_ERROR, '上传摘要计算异常');
+    }
+
+    const root = this.attachmentsRoot();
+    const head = await readFileHead(tmpFile).catch(() => undefined);
+    const sniff = head !== undefined ? sniffImageHead(head) : null;
+    const isImage = sniff !== null || declared.startsWith('image/');
+    const shardDir = path.join(root, isImage ? 'objects' : 'file-objects', hex.slice(0, 2));
+    const target = path.join(shardDir, hex);
+    try {
+      await fs.promises.mkdir(shardDir, { recursive: true });
+      let reused = false;
+      try {
+        await fs.promises.access(target);
+        reused = true;
+      } catch {
+        try {
+          await fs.promises.rename(tmpFile, target);
+        } catch (renameError) {
+          if (renameError !== null && typeof renameError === 'object' && renameError.code === 'EEXIST') {
+            reused = true;
+          } else {
+            throw renameError;
+          }
+        }
+      }
+      if (reused) await fs.promises.rm(tmpFile, { force: true }).catch(() => {});
+      const mediaType = sniff !== null
+        ? sniff.mediaType
+        : (declared.length > 0 ? declared : 'application/octet-stream');
+      const kind = isImage ? 'image' : (declared.startsWith('video/') ? 'video' : 'file');
+      return {
+        attachmentId: `sha256:${hex}`,
+        mediaType,
+        name,
+        bytes,
+        width: sniff !== null ? sniff.width : 0,
+        height: sniff !== null ? sniff.height : 0,
+        kind,
+      };
+    } catch (error) {
+      await fs.promises.rm(tmpFile, { force: true }).catch(() => {});
+      throw asBridgeError(error);
+    }
   }
 
   // ── 工作区 ─────────────────────────────────────────────────────────────

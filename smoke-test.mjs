@@ -10,13 +10,17 @@
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import { existsSync, readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket } from 'ws';
 
 import { apply, normalize } from './index.js';
 import { projectEvents } from './adapter/project.js';
+
+/** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 
 // ── 假 DSH 服务 ────────────────────────────────────────────────────────────
 
@@ -56,6 +60,11 @@ function makeFakeCtx() {
   const handlers = new Map();
   const disposers = [];
   const fakeServices = {
+    // 测试辅助记录（v3.1 断言用）
+    __archived: [],
+    __staged: [],
+    __appended: [],
+    __liveSessions: new Map(),
     webServer: { register: () => () => {} },
     connection: { admit: () => true },
     sessionController: {
@@ -125,10 +134,14 @@ function makeFakeCtx() {
           error.code = 'session/not-found';
           throw error;
         }
+        // 模拟真实日志：桥/预设服务追加的旋钮事件也出现在会话日志里
+        const appended = fakeServices.__appended
+          .filter((item) => item.id === sessionId)
+          .map((item, index) => ({ type: item.type, seq: 9000 + index, time: 9000 + index, data: item.data }));
         return {
           session: { version: 4, id: sessionId, createdAt: 1000, cwd: 'E:\\work', isSeeded: false, agentPreset: 'cordis' },
           inheritedEventCount: 0,
-          events: fakeEvents,
+          events: [...fakeEvents, ...appended],
         };
       },
       async readTitleSnapshots(ids) {
@@ -148,7 +161,8 @@ function makeFakeCtx() {
       },
     },
     workspaceController: {
-      async archiveSession() {
+      async archiveSession(request) {
+        fakeServices.__archived.push(request.sessionId);
         return { archivedSessionIds: [SESSION_B] };
       },
       async unarchiveSession() {
@@ -161,12 +175,97 @@ function makeFakeCtx() {
         return undefined;
       },
     },
+    // v3.1：文件附件走 fileUploads 暂存收据（官方 dsh-client-file-upload 的形状）
+    fileUploads: {
+      async uploadStream(request) {
+        const chunks = [];
+        for await (const chunk of request.data) chunks.push(Buffer.from(chunk));
+        const data = Buffer.concat(chunks);
+        const hex = crypto.createHash('sha256').update(data).digest('hex');
+        fakeServices.__staged.push({
+          sessionId: request.sessionId,
+          name: request.name ?? '',
+          bytes: data.length,
+        });
+        return {
+          receiptId: `receipt-${fakeServices.__staged.length}`,
+          file: { attachmentId: `sha256:${hex}`, name: request.name ?? '', bytes: data.length },
+        };
+      },
+    },
     agentDefaultModel: {
       currentSelection() {
         return { provider: 'magpie', model: 'x/y', reasoningEffort: 'high' };
       },
       async saveSelection() {
         return undefined;
+      },
+    },
+    // v3.1 §9.5：活会话存储 + 权限预设（形状按 dsh-permission-presets 官方服务）
+    sessions: {
+      get(sessionId) {
+        return fakeServices.__liveSessions.get(sessionId);
+      },
+    },
+    permissionPresets: {
+      __knobs: new Map(),
+      catalog() {
+        return {
+          options: [
+            { value: 'workspace-write', name: 'workspace-write' },
+            { value: 'danger-full-access', name: 'danger-full-access' },
+          ],
+          defaultOptions: [
+            { value: 'workspace-write', name: 'workspace-write' },
+            { value: 'danger-full-access', name: 'danger-full-access' },
+          ],
+          defaultPreset: 'workspace-write',
+        };
+      },
+      resolve(name) {
+        if (name === 'workspace-write') return { sandbox: 'workspace-write', approval: 'ask' };
+        if (name === 'danger-full-access') return { sandbox: 'danger-full-access', approval: 'never' };
+        throw new Error(`permission: unknown preset "${name}"`);
+      },
+      current(session) {
+        // 按真实 derive() 语义折叠该会话的旋钮事件（真实实现折会话日志）
+        let sandbox;
+        let approval;
+        let preset;
+        for (const item of fakeServices.__appended) {
+          if (item.id !== session.id) continue;
+          if (item.type === 'sandbox/mode') sandbox = item.data.mode;
+          else if (item.type === 'approval/policy') approval = item.data.policy;
+          else if (item.type === 'permission/preset') preset = item.data.preset;
+        }
+        const specOf = (name) => {
+          try {
+            return this.resolve(name);
+          } catch {
+            return undefined;
+          }
+        };
+        if (preset !== undefined) {
+          const spec = specOf(preset);
+          if (spec !== undefined && spec.sandbox === sandbox) return preset;
+        }
+        if (sandbox !== undefined) {
+          for (const name of ['workspace-write', 'danger-full-access']) {
+            const spec = specOf(name);
+            if (spec !== undefined && spec.sandbox === sandbox && spec.approval === (approval ?? spec.approval)) return name;
+          }
+          return 'custom';
+        }
+        // 无旋钮事件 → 组合默认（假服务默认 = workspace-write 预设）
+        return 'workspace-write';
+      },
+      set(session, name) {
+        // 按真实 apply()：permission/preset + setSandboxMode + setApprovalPolicy 三条事件
+        const spec = this.resolve(name);
+        fakeServices.permissionPresets.__knobs.set(session.id, { sandbox: spec.sandbox, approval: spec.approval, preset: name });
+        fakeServices.__appended.push({ id: session.id, type: 'permission/preset', data: { preset: name } });
+        fakeServices.__appended.push({ id: session.id, type: 'sandbox/mode', data: { mode: spec.sandbox } });
+        fakeServices.__appended.push({ id: session.id, type: 'approval/policy', data: { policy: spec.approval } });
       },
     },
     workspaceRegistry: {
@@ -291,7 +390,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.0.1');
+  assert.equal(health.json.bridgeVersion, '3.1.0');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -402,7 +501,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.0.1');
+  assert.equal(hello.payload.bridgeVersion, '3.1.0');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -488,8 +587,13 @@ async function main() {
   assert.equal(imageResponse.headers.get('content-type'), 'image/png', '图片 Content-Type 应为 image/png');
   assert.equal(imageBody.length, pngBytes.length, '图片字节数应一致');
   assert.ok(imageBody.equals(pngBytes), '图片字节内容应一致');
+  // ?token= 查询参数鉴权（手机 Image/Video 组件带不了 Authorization 头）
+  const queryTokenImage = await fetch(`http://127.0.0.1:${port}/api/attachments/sha256%3A${attachmentHex}?token=${encodeURIComponent(paired.json.token)}`);
+  assert.equal(queryTokenImage.status, 200, '?token= 查询参数应通过鉴权');
+  assert.ok(Buffer.from(await queryTokenImage.arrayBuffer()).equals(pngBytes), '?token= 取到的图片字节应一致');
   const missingImage = await request(port, 'GET', `/api/attachments/sha256:${'0'.repeat(64)}`, { token: paired.json.token });
-  assert.equal(missingImage.json.error.code, 'NOT_SUPPORTED', '不存在的附件应报 NOT_SUPPORTED');
+  assert.equal(missingImage.status, 404, '不存在的附件应返回 404');
+  assert.equal(missingImage.json.error.code, 'ATTACHMENT_NOT_FOUND', '不存在的附件应报 ATTACHMENT_NOT_FOUND');
   const badId = await request(port, 'GET', '/api/attachments/not-a-hash', { token: paired.json.token });
   assert.equal(badId.json.error.code, 'INVALID_PARAM', '非法附件 ID 应报 INVALID_PARAM');
   if (previousAttachmentHome === undefined) delete process.env.DSH_HOME;
@@ -513,7 +617,8 @@ async function main() {
   assert.equal(mediaResponse.headers.get('content-type'), 'video/mp4', '视频 Content-Type 应为 video/mp4');
   assert.ok(mediaBody.equals(mediaBytes), '视频字节内容应一致');
   const missingMedia = await request(port, 'GET', '/api/media/nope.mp4', { token: paired.json.token });
-  assert.equal(missingMedia.json.error.code, 'NOT_SUPPORTED', '不存在的媒体应报 NOT_SUPPORTED');
+  assert.equal(missingMedia.status, 404, '不存在的媒体应返回 404');
+  assert.equal(missingMedia.json.error.code, 'MEDIA_NOT_FOUND', '不存在的媒体应报 MEDIA_NOT_FOUND');
   const traversal = await request(port, 'GET', '/api/media/..%2F..%2Fsecret.txt', { token: paired.json.token });
   assert.equal(traversal.json.error.code, 'INVALID_PARAM', '路径穿越应报 INVALID_PARAM');
   const rangeResponse = await fetch(`http://127.0.0.1:${port}/api/media/${mediaName}`, {
@@ -544,7 +649,8 @@ async function main() {
   assert.equal(fileResponse.headers.get('content-type'), 'application/octet-stream', '文件 Content-Type 应为 octet-stream');
   assert.ok(fileBody.equals(fileBytes), '文件字节内容应一致');
   const missingFile = await request(port, 'GET', `/api/files/sha256:${'f'.repeat(64)}`, { token: paired.json.token });
-  assert.equal(missingFile.json.error.code, 'NOT_SUPPORTED', '不存在的文件应报 NOT_SUPPORTED');
+  assert.equal(missingFile.status, 404, '不存在的文件应返回 404');
+  assert.equal(missingFile.json.error.code, 'ATTACHMENT_NOT_FOUND', '不存在的文件应报 ATTACHMENT_NOT_FOUND');
   if (previousFileHome === undefined) delete process.env.DSH_HOME;
   else process.env.DSH_HOME = previousFileHome;
   pass('GET /api/files/:id 二进制文件');
@@ -613,7 +719,393 @@ async function main() {
   assert.ok(assistant.text.includes('生成完成'), '助手正文其余内容应保留');
   pass('生成类工具媒体投影（图片/视频块 + 剥离本机路径）');
 
-  // 18) /pair 页面（本机可打开）
+  // 18) v3.1：POST /api/uploads 上传（幂等 / 尺寸解析 / 超限 413）
+  const uploadHome = mkdtempSync(join(tmpdir(), 'dsh-bridge-upload-'));
+  const previousUploadHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = uploadHome;
+
+  const upload = async (bytes, headers = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/uploads`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/octet-stream',
+        ...headers,
+      },
+      body: bytes,
+    });
+    const text = await response.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = undefined;
+    }
+    return { status: response.status, json };
+  };
+
+  const pngUploadName = encodeURIComponent('截图 测试.png');
+  const uploaded = await upload(pngBytes, { 'X-File-Name': pngUploadName, 'X-Media-Type': 'image/png' });
+  assert.equal(uploaded.status, 200, '上传图片应返回 200');
+  assert.ok(uploaded.json.attachmentId.startsWith('sha256:'), 'attachmentId 应为 sha256 前缀');
+  assert.equal(uploaded.json.attachmentId, `sha256:${attachmentHex}`, 'attachmentId 应等于内容 sha256');
+  assert.equal(uploaded.json.mediaType, 'image/png');
+  assert.equal(uploaded.json.name, '截图 测试.png', 'X-File-Name 应解码中文与空格');
+  assert.equal(uploaded.json.bytes, pngBytes.length);
+  assert.equal(uploaded.json.width, 1, 'PNG 魔数应解析出宽');
+  assert.equal(uploaded.json.height, 1, 'PNG 魔数应解析出高');
+  assert.equal(uploaded.json.kind, 'image');
+  const uploadedObject = join(uploadHome, 'attachments', 'v1', 'objects', attachmentHex.slice(0, 2), attachmentHex);
+  assert.ok(existsSync(uploadedObject), '图片对象应写入 attachments/v1/objects/<前2位>/<hex>');
+  pass('POST /api/uploads 上传 PNG（对象落盘 + 中文文件名解码 + 尺寸解析）');
+
+  // 幂等：同字节重传直接复用对象
+  const reuploaded = await upload(pngBytes, { 'X-File-Name': pngUploadName, 'X-Media-Type': 'image/png' });
+  assert.equal(reuploaded.status, 200);
+  assert.equal(reuploaded.json.attachmentId, uploaded.json.attachmentId, '同字节重传应得到同一 attachmentId');
+  const shardFiles = readdirSync(join(uploadHome, 'attachments', 'v1', 'objects', attachmentHex.slice(0, 2)));
+  assert.equal(shardFiles.length, 1, '同对象不应重复落盘');
+  pass('POST /api/uploads 幂等（同 sha256 复用已有对象）');
+
+  // JPEG 魔数尺寸解析（手工构造 SOF0：7x5）
+  const jpegBytes = Buffer.from(
+    'ffd8' + 'ffe000104a46494600010100000100010000' + 'ffc00011080005000703011100021101031101',
+    'hex',
+  );
+  const jpegUpload = await upload(jpegBytes, { 'X-File-Name': 'photo.jpg', 'X-Media-Type': 'image/jpeg' });
+  assert.equal(jpegUpload.status, 200);
+  assert.equal(jpegUpload.json.mediaType, 'image/jpeg');
+  assert.equal(jpegUpload.json.width, 7, 'JPEG SOF0 应解析出宽');
+  assert.equal(jpegUpload.json.height, 5, 'JPEG SOF0 应解析出高');
+  assert.equal(jpegUpload.json.kind, 'image');
+  pass('POST /api/uploads JPEG 尺寸魔数解析');
+
+  // 非图片 → file-objects，kind=file，宽高 0
+  const pdfBytes = Buffer.from('%PDF-1.4 smoke', 'utf8');
+  const pdfUpload = await upload(pdfBytes, { 'X-File-Name': 'doc.pdf', 'X-Media-Type': 'application/pdf' });
+  assert.equal(pdfUpload.status, 200);
+  assert.equal(pdfUpload.json.kind, 'file');
+  assert.equal(pdfUpload.json.mediaType, 'application/pdf');
+  assert.equal(pdfUpload.json.width, 0);
+  assert.equal(pdfUpload.json.height, 0);
+  const pdfHex = pdfUpload.json.attachmentId.slice('sha256:'.length);
+  assert.ok(existsSync(join(uploadHome, 'attachments', 'v1', 'file-objects', pdfHex.slice(0, 2), pdfHex)), '文件对象应写入 file-objects');
+  pass('POST /api/uploads 非图片对象（file-objects + kind=file）');
+
+  // 超限 413：Content-Length 预检（不等真实传完 200MB）
+  const oversize = await new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path: '/api/uploads',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(MAX_UPLOAD_BYTES + 1),
+          'X-File-Name': 'big.bin',
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          let body;
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            body = undefined;
+          }
+          resolve({ status: res.statusCode, body });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end('x');
+  });
+  assert.equal(oversize.status, 413, '超过 200MB 应返回 413');
+  assert.equal(oversize.body.error.code, 'INVALID_PARAM');
+  assert.ok(oversize.body.error.message.includes('200 MB'), '413 message 应说明大小上限');
+  pass('POST /api/uploads 超限返回 413 INVALID_PARAM');
+
+  // 19) v3.1：带附件发消息（附件块拼在 text 之前）
+  const sentImage = await request(port, 'POST', `/api/sessions/${SESSION_A}/messages`, {
+    token,
+    body: {
+      text: '看看这张图',
+      attachments: [{
+        attachmentId: uploaded.json.attachmentId,
+        name: '截图.png',
+        mediaType: 'image/png',
+        bytes: pngBytes.length,
+      }],
+    },
+  });
+  assert.equal(sentImage.status, 202);
+  const imagePrompt = ctx.__services.sessionController.lastPrompt;
+  assert.equal(imagePrompt.content.length, 2);
+  assert.equal(imagePrompt.content[0].type, 'image', '图片块应排在 text 之前');
+  assert.equal(imagePrompt.content[0].attachment.attachmentId, uploaded.json.attachmentId);
+  assert.equal(imagePrompt.content[0].attachment.mediaType, 'image/png');
+  assert.equal(imagePrompt.content[0].attachment.width, 1);
+  assert.equal(imagePrompt.content[0].attachment.height, 1);
+  assert.equal(imagePrompt.content[0].attachment.name, '截图.png');
+  assert.equal(imagePrompt.content[1].type, 'text');
+  assert.equal(imagePrompt.content[1].text, '看看这张图');
+  pass('REST 带图片附件发消息（image attachment 块 + text 顺序）');
+
+  const sentFile = await request(port, 'POST', `/api/sessions/${SESSION_A}/messages`, {
+    token,
+    body: {
+      text: '这是文档',
+      attachments: [{
+        attachmentId: pdfUpload.json.attachmentId,
+        name: '文档.pdf',
+        mediaType: 'application/pdf',
+        bytes: pdfBytes.length,
+      }],
+    },
+  });
+  assert.equal(sentFile.status, 202);
+  const filePrompt = ctx.__services.sessionController.lastPrompt;
+  assert.equal(filePrompt.content.length, 2);
+  assert.equal(filePrompt.content[0].type, 'file', '文件应映射为 file 块（经 fileUploads 暂存收据）');
+  assert.ok(filePrompt.content[0].receiptId.startsWith('receipt-'), 'file 块应携带 DSH 暂存收据');
+  const staged = ctx.__services.__staged;
+  const stagedEntry = staged.find((item) => item.name === '文档.pdf');
+  assert.ok(stagedEntry !== undefined, '应调用 fileUploads.uploadStream 暂存文件');
+  assert.equal(stagedEntry.bytes, pdfBytes.length);
+  assert.equal(stagedEntry.sessionId, SESSION_A);
+  assert.equal(filePrompt.content[1].type, 'text');
+  pass('REST 带文件附件发消息（fileUploads 暂存收据）');
+
+  // 未上传过的 attachmentId → 404
+  const unknownAttachment = await request(port, 'POST', `/api/sessions/${SESSION_A}/messages`, {
+    token,
+    body: {
+      text: '带一个没上传过的附件',
+      attachments: [{ attachmentId: `sha256:${'0'.repeat(64)}`, name: 'ghost.png', mediaType: 'image/png', bytes: 1 }],
+    },
+  });
+  assert.equal(unknownAttachment.status, 404, '未上传的 attachmentId 应返回 404');
+  assert.equal(unknownAttachment.json.error.code, 'INVALID_PARAM');
+  assert.ok(unknownAttachment.json.error.message.includes('上传'), '错误信息应提示先上传');
+  pass('未上传过的 attachmentId → 404 INVALID_PARAM');
+
+  // 超过 9 个附件 → 400
+  const tooMany = await request(port, 'POST', `/api/sessions/${SESSION_A}/messages`, {
+    token,
+    body: {
+      text: '太多附件',
+      attachments: Array.from({ length: 10 }, () => ({
+        attachmentId: `sha256:${'a'.repeat(64)}`,
+        name: 'x.png',
+        mediaType: 'image/png',
+        bytes: 1,
+      })),
+    },
+  });
+  assert.equal(tooMany.status, 400);
+  assert.equal(tooMany.json.error.code, 'INVALID_PARAM');
+  pass('单条消息超过 9 个附件 → INVALID_PARAM');
+
+  // 纯附件消息（text 为空）也允许，块结构保持附件在前
+  const sentImageOnly = await request(port, 'POST', `/api/sessions/${SESSION_A}/messages`, {
+    token,
+    body: {
+      text: '',
+      attachments: [{
+        attachmentId: uploaded.json.attachmentId,
+        name: '截图.png',
+        mediaType: 'image/png',
+        bytes: pngBytes.length,
+      }],
+    },
+  });
+  assert.equal(sentImageOnly.status, 202);
+  const imageOnlyPrompt = ctx.__services.sessionController.lastPrompt;
+  assert.equal(imageOnlyPrompt.content.length, 1);
+  assert.equal(imageOnlyPrompt.content[0].type, 'image');
+  pass('纯附件消息（空 text）允许且块结构正确');
+
+  // WS send 载荷同样支持 attachments
+  const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
+  await waitFor(ws2, (frame) => frame.type === 'hello');
+  const wsAccepted = waitFor(ws2, (frame) => frame.type === 'send.accepted');
+  ws2.send(JSON.stringify({
+    type: 'send',
+    sessionId: SESSION_A,
+    text: 'WS带图',
+    attachments: [{ attachmentId: uploaded.json.attachmentId, name: '截图.png', mediaType: 'image/png', bytes: pngBytes.length }],
+  }));
+  await wsAccepted;
+  const wsPrompt = ctx.__services.sessionController.lastPrompt;
+  assert.equal(wsPrompt.content[0].type, 'image', 'WS send 的附件也应映射为 image 块');
+  assert.equal(wsPrompt.content[1].text, 'WS带图');
+  ws2.close();
+  pass('WS send 载荷新增 attachments');
+
+  // 20) v3.1：归档会话删除（purge 降级 + batch-delete 部分成功）
+  const purged = await request(port, 'DELETE', `/api/sessions/${SESSION_B}?purge=true`, { token });
+  assert.equal(purged.status, 200);
+  assert.deepEqual(purged.json.purged, [], 'DSH 无硬删能力，purged 应为空');
+  assert.deepEqual(purged.json.archivedFallback, [SESSION_B], '应降级为归档并在 archivedFallback 上报');
+  assert.deepEqual(purged.json.failed, []);
+  assert.ok(ctx.__services.__archived.includes(SESSION_B), 'purge 应真实调用 workspaceController.archiveSession');
+  pass('DELETE ?purge=true 降级归档（archivedFallback 如实上报）');
+
+  const batch = await request(port, 'POST', '/api/sessions/batch-delete', {
+    token,
+    body: { ids: [SESSION_A, 'session-nope', SESSION_A] },
+  });
+  assert.equal(batch.status, 200, '批量删除部分成功应返回 200');
+  assert.deepEqual(batch.json.purged, []);
+  assert.deepEqual(batch.json.archivedFallback, [SESSION_A], '重复 id 应去重');
+  assert.equal(batch.json.failed.length, 1);
+  assert.equal(batch.json.failed[0].id, 'session-nope');
+  assert.equal(batch.json.failed[0].code, 'SESSION_NOT_FOUND');
+  assert.ok(typeof batch.json.failed[0].message === 'string' && batch.json.failed[0].message.length > 0);
+  pass('POST /api/sessions/batch-delete（部分成功 + 三个数组齐全）');
+
+  const overBatch = await request(port, 'POST', '/api/sessions/batch-delete', {
+    token,
+    body: { ids: Array.from({ length: 201 }, (_, index) => `session-x${index}`) },
+  });
+  assert.equal(overBatch.status, 400);
+  assert.equal(overBatch.json.error.code, 'INVALID_PARAM');
+  pass('batch-delete 超过 200 个 → INVALID_PARAM');
+
+  if (previousUploadHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousUploadHome;
+
+  // 21) v3.1 安全修复：隧道流量（Host: dsh-phone-bridge-tunnel）不得触碰仅本机接口
+  // 注：每个请求独立 agent（不复用 keep-alive 连接）——前面的 413 测试故意声明
+  // Content-Length 超限但只发 1 字节（非法分帧），服务器销毁该连接，
+  // 复用池化死连接会让下一个请求误报 ECONNRESET。
+  const rawRequest = (method, pathname, headers = {}, body) => new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method,
+        path: pathname,
+        headers,
+        agent: new http.Agent({ keepAlive: false }),
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = undefined;
+          }
+          resolve({ status: res.statusCode, text, json });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+
+  const tunnelHeaders = { Host: 'dsh-phone-bridge-tunnel' };
+  const tunnelPairingCode = await rawRequest('GET', '/api/pairing-code', tunnelHeaders);
+  assert.equal(tunnelPairingCode.status, 403, '隧道流量取配对码必须 403');
+  assert.equal(tunnelPairingCode.json.error.code, 'ROUTE_LOCAL_ONLY');
+  const tunnelPairPage = await rawRequest('GET', '/pair', tunnelHeaders);
+  assert.equal(tunnelPairPage.status, 403, '隧道流量打开 /pair 页必须 403');
+  const loopbackPairingCode = await rawRequest('GET', '/api/pairing-code', { Host: '127.0.0.1' });
+  assert.equal(loopbackPairingCode.status, 200, '本机（普通 Host）取配对码不受影响');
+  pass('隧道流量访问仅本机接口 → 403 ROUTE_LOCAL_ONLY（本机不受影响）');
+
+  // /api/pair 隧道可达（合法的外地配对路径）
+  const tunnelPair = await rawRequest('POST', '/api/pair', {
+    Host: 'dsh-phone-bridge-tunnel',
+    'Content-Type': 'application/json',
+  }, JSON.stringify({ code: loopbackPairingCode.json.code, clientName: '隧道配对' }));
+  assert.equal(tunnelPair.status, 200, '/api/pair 应保持隧道可达');
+  assert.ok(tunnelPair.json.token.startsWith('dsb_'));
+  pass('/api/pair 隧道可达（防爆破前）');
+
+  // /api/pair 防爆破：同源连续错 20 次 → 429 RATE_LIMITED + retryAfter
+  let saw429 = false;
+  let saw403AfterFails = false;
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const failed = await rawRequest('POST', '/api/pair', {
+      Host: '127.0.0.1',
+      'Content-Type': 'application/json',
+    }, JSON.stringify({ code: '999999' }));
+    if (failed.status === 429) {
+      saw429 = true;
+      assert.equal(failed.json.error.code, 'RATE_LIMITED');
+      assert.ok(Number(failed.json.error.retryAfter) > 0, '429 应带 retryAfter');
+      break;
+    }
+    assert.equal(failed.status, 403);
+    assert.equal(failed.json.error.code, 'PAIRING_CODE_INVALID');
+    saw403AfterFails = true;
+  }
+  assert.ok(saw403AfterFails, '锁定前应返回 403 PAIRING_CODE_INVALID');
+  assert.ok(saw429, '同源连续失败 20 次应触发 429 锁定');
+  pass('/api/pair 防爆破（同源连错 20 次 → 429 RATE_LIMITED）');
+
+  // 22) v3.1 §9.5：会话权限模式
+  ctx.__services.__liveSessions.set(SESSION_A, {
+    id: SESSION_A,
+    append(type, data) {
+      ctx.__services.__appended.push({ id: this.id, type, data });
+    },
+  });
+  const permission = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(permission.status, 200);
+  assert.equal(permission.json.mode, 'workspace-write', '无旋钮事件时应折算部署默认');
+  assert.equal(permission.json.approval, 'every-step');
+  pass('GET /api/sessions/:id/permission（默认档 + approval 映射）');
+
+  const putFull = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { mode: 'full-access' },
+  });
+  assert.equal(putFull.status, 200);
+  assert.equal(putFull.json.mode, 'full-access');
+  const presetSwitch = ctx.__services.__appended.find((item) => item.type === 'permission/preset');
+  assert.ok(presetSwitch !== undefined, 'full-access 应走 permissionPresets.set（官方预设写路径）');
+  assert.equal(presetSwitch.data.preset, 'danger-full-access');
+  const afterFull = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(afterFull.json.mode, 'full-access');
+  assert.equal(afterFull.json.approval, 'auto');
+  pass('PUT 权限模式 full-access（permissionPresets.set 官方写路径）');
+
+  const putReadOnly = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { mode: 'read-only' },
+  });
+  assert.equal(putReadOnly.status, 200);
+  assert.equal(putReadOnly.json.mode, 'read-only');
+  const sandboxSwitch = ctx.__services.__appended.find((item) => item.type === 'sandbox/mode' && item.data.mode === 'read-only');
+  assert.ok(sandboxSwitch !== undefined, 'read-only（默认预设表没有）应直写 sandbox/mode 事件');
+  assert.equal(sandboxSwitch.data.mode, 'read-only');
+  const afterReadOnly = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(afterReadOnly.json.mode, 'read-only', '下一次 GET 应读到最后一条 sandbox/mode 旋钮');
+  pass('PUT 权限模式 read-only（sandbox/mode 事件直写 + GET 折叠生效）');
+
+  const putBogus = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { mode: 'bogus' },
+  });
+  assert.equal(putBogus.status, 400);
+  assert.equal(putBogus.json.error.code, 'INVALID_PARAM');
+  const permissionMissing = await request(port, 'GET', '/api/sessions/session-nope/permission', { token });
+  assert.equal(permissionMissing.status, 404);
+  assert.equal(permissionMissing.json.error.code, 'SESSION_NOT_FOUND');
+  pass('权限模式参数校验（非法 mode 400 / 会话不存在 404）');
+
+  // 23) /pair 页面（本机可打开）
   const pairPage = await request(port, 'GET', '/pair');
   assert.equal(pairPage.status, 200);
   assert.ok(pairPage.text.includes('配对码'));
