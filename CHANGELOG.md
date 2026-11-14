@@ -1,5 +1,32 @@
 ﻿# CHANGELOG
 
+## 3.4.0（2026-11-15）
+
+### 新增（contract §9.6：审批策略可写）
+
+- **PUT /api/sessions/:id/permission 支持审批策略**：载荷新增 `approval`
+  （`every-step` ↔ DSH `ask`；`auto` ↔ `never`），与 `mode` 任意组合：
+  只传 approval 不动 mode；只传 mode 不动 approval；两者都传先 mode 后
+  approval（折叠语义取最后一条，显式 approval 覆盖预设自带的审批默认）
+- **写路径核实**（app.asar 源码）：`setApprovalPolicy(session, policy)`
+  （dsh-user-approval/src/index.ts:117-122）校验 `ask|never` 后
+  `session.append('approval/policy', { policy })`——"the sole durable
+  representation of a session policy override"；事件载荷 schema
+  （index.ts:41-44，缺 source = 运行时切换）、已知事件词表
+  （dsh-session/src/known-event-types.ts:27）、折叠 last-write-wins
+  （index.ts:99）。桥作为进程内插件通过活 Session 实例追加同一事件
+  （与 §9.5 sandbox/mode 直写同一手法）
+- GET /permission 的 approval 同步反映当前值（写完 GET 回读一致，
+  smoke 固化「只写 approval 不动 mode + 回读一致」）
+- 空 PUT（mode/approval 都缺）→ 400；非法值 → 400 INVALID_PARAM
+
+### 说明
+
+- 冒烟测试 63 → **67 项**（approval 单独写+回读、组合 patch、预设冲突覆盖、
+  无效值/空 body/会话不存在拒绝）
+- 包版本与 `BRIDGE_VERSION` 升至 **3.4.0**；`CONTRACT_VERSION` 仍为 3
+
+
 ## 3.3.0（2026-11-15）
 
 ### 新增（contract §10.1：通道扩展，覆盖市面全部内网穿透）

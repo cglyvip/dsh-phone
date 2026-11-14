@@ -317,12 +317,19 @@ export function createHttpHandler(deps) {
     return adapter.getPermission(decodeURIComponent(params[0]));
   }
 
-  /** PUT /api/sessions/:id/permission（v3.1 §9.5：运行时改权限模式）；成功后广播 session.updated。 */
+  /** PUT /api/sessions/:id/permission（§9.5/§9.6：运行时改权限模式与审批策略，任意组合）；成功后广播 session.updated。 */
   async function handlePutPermission(params, request) {
     const sessionId = decodeURIComponent(params[0]);
     const body = await readJsonBody(request);
-    const mode = requireString(body, 'mode');
-    const result = await adapter.setPermission(sessionId, mode.trim());
+    const mode = typeof body.mode === 'string' && body.mode.trim().length > 0 ? body.mode.trim() : undefined;
+    const approval = typeof body.approval === 'string' && body.approval.trim().length > 0 ? body.approval.trim() : undefined;
+    if (mode === undefined && approval === undefined) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, 'PUT 需要 mode / approval 至少一项');
+    }
+    const result = await adapter.setPermission(sessionId, {
+      ...(mode !== undefined ? { mode } : {}),
+      ...(approval !== undefined ? { approval } : {}),
+    });
     // 已有机制：让订阅该会话的手机刷新标签
     eventHub.publish('session.updated', sessionId, Date.now(), { sessionId }, 0);
     return result;

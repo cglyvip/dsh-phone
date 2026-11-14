@@ -496,7 +496,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.3.0');
+  assert.equal(health.json.bridgeVersion, '3.4.0');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -607,7 +607,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.3.0');
+  assert.equal(hello.payload.bridgeVersion, '3.4.0');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -1210,6 +1210,65 @@ async function main() {
   assert.equal(permissionMissing.status, 404);
   assert.equal(permissionMissing.json.error.code, 'SESSION_NOT_FOUND');
   pass('权限模式参数校验（非法 mode 400 / 会话不存在 404）');
+
+  // 22b) v3.4 §9.6：审批策略可写（approval 单独写 / 组合 patch / 回读一致 / 无效值拒绝）
+  const approvalOnly = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { approval: 'every-step' },
+  });
+  assert.equal(approvalOnly.status, 200);
+  assert.equal(approvalOnly.json.approval, 'every-step');
+  assert.equal(approvalOnly.json.mode, undefined, '只传 approval 不应返回/改动 mode');
+  const approvalOnlyPolicy = [...ctx.__services.__appended]
+    .reverse()
+    .find((item) => item.type === 'approval/policy' && item.id === SESSION_A);
+  assert.ok(approvalOnlyPolicy !== undefined, 'approval 应以官方 approval/policy 事件落盘');
+  assert.equal(approvalOnlyPolicy.data.policy, 'ask', 'every-step ↔ ask');
+  const afterApprovalOnly = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(afterApprovalOnly.json.approval, 'every-step', 'GET 必须回读一致');
+  assert.equal(afterApprovalOnly.json.mode, 'read-only', '只写 approval 不动 mode');
+  pass('PUT approval 单独写（ask 事件落盘 + mode 不受影响 + GET 回读一致）');
+
+  const comboPatch = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { mode: 'full-access', approval: 'auto' },
+  });
+  assert.equal(comboPatch.status, 200);
+  assert.equal(comboPatch.json.mode, 'full-access');
+  assert.equal(comboPatch.json.approval, 'auto');
+  const afterCombo = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(afterCombo.json.mode, 'full-access');
+  assert.equal(afterCombo.json.approval, 'auto');
+  pass('PUT mode+approval 组合 patch（两者同时生效）');
+
+  // 组合冲突覆盖：预设自带的 approval 被显式 approval 覆盖（fold 最后一条生效）
+  const comboConflict = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { mode: 'workspace-write', approval: 'auto' },
+  });
+  assert.equal(comboConflict.status, 200);
+  const afterConflict = await request(port, 'GET', `/api/sessions/${SESSION_A}/permission`, { token });
+  assert.equal(afterConflict.json.mode, 'workspace-write', '沙盒切到 workspace-write');
+  assert.equal(afterConflict.json.approval, 'auto', '预设默认 ask 被显式 auto 覆盖（最后一条 approval/policy 生效）');
+  pass('PUT 组合冲突覆盖（预设 approval 被显式 approval 覆盖）');
+
+  const badApproval = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, {
+    token,
+    body: { approval: 'sometimes' },
+  });
+  assert.equal(badApproval.status, 400);
+  assert.equal(badApproval.json.error.code, 'INVALID_PARAM');
+  assert.ok(badApproval.json.error.message.includes('approval'), '错误信息应指向 approval');
+  const emptyPermissionPut = await request(port, 'PUT', `/api/sessions/${SESSION_A}/permission`, { token, body: {} });
+  assert.equal(emptyPermissionPut.status, 400);
+  assert.ok(emptyPermissionPut.json.error.message.includes('至少一项'));
+  const missingSessionApproval = await request(port, 'PUT', '/api/sessions/session-nope/permission', {
+    token,
+    body: { approval: 'auto' },
+  });
+  assert.equal(missingSessionApproval.status, 404);
+  pass('approval 无效值 / 空 body / 会话不存在全部拒绝');
+
 
   // 23) /pair 页面（本机可打开）
   const pairPage = await request(port, 'GET', '/pair');

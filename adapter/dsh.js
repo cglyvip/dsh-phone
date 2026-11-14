@@ -51,6 +51,8 @@ const SANDBOX_TO_MODE = {
   'danger-full-access': 'full-access',
 };
 const APPROVAL_TO_WIRE = { ask: 'every-step', never: 'auto' };
+/** v3.4 §9.6：手机端 approval 值 → DSH 审批策略（APPROVAL_POLICIES = ['ask','never']）。 */
+const WIRE_TO_APPROVAL = { 'every-step': 'ask', auto: 'never' };
 
 /** 附件对象文件头探测时最多读取的字节数（JPEG SOF 通常在几十 KB 内）。 */
 const IMAGE_HEAD_BYTES = 256 * 1024;
@@ -1230,53 +1232,104 @@ export class DshAdapter {
    *
    * @returns {Promise<{sessionId: string, mode: string}>}
    */
-  async setPermission(sessionId, mode) {
+  /**
+   * 运行时修改会话权限（contract §9.5 + §9.6）：{mode?, approval?} 任意组合。
+   *
+   * approval 写路径核实（app.asar 源码，v3.4 复核）：
+   *   - setApprovalPolicy(session, policy)（dsh-user-approval/src/index.ts:117-122）
+   *     —— 校验 policy ∈ ['ask','never']（:71）后 `session.append('approval/policy',
+   *     { policy })`，注释明言 "Append the sole durable representation of a session
+   *     policy override"。它是包内导出函数而非 ctx 服务，桥作为进程内 cordis 插件
+   *     通过活 Session 实例追加同一事件（与 v3.1 sandbox/mode 直写同一手法，
+   *     ds-bot 亦跨 fiber 写会话）。
+   *   - 事件载荷 schema：dsh-user-approval/src/index.ts:41-44
+   *     `'approval/policy': { policy, source? }`（缺 source = 运行时切换）；
+   *     属于 dsh-session/src/known-event-types.ts:27 已知事件词表。
+   *   - 折叠语义：dsh-user-approval/src/index.ts:99 —— 最后一条 approval/policy
+   *     生效（last-write-wins），因此 mode（预设会附带写一次 approval）先写、
+   *     approval 后写即可让用户显式选择的审批覆盖预设默认。
+   *   - ds-bot 的每 Bot 权限同样最终经 permissionPresets.set → apply 里的
+   *     setApprovalPolicy 落盘（ds-bot/src/host/permissions.js:28 +
+   *     dsh-permission-presets/src/index.ts:398-411）。
+   *
+   * 只传 approval 不动 mode；只传 mode 不动 approval；两者都传先 mode 后 approval。
+   *
+   * @param {string} sessionId
+   * @param {{ mode?: string, approval?: string }} payload
+   * @returns {Promise<{sessionId: string, mode?: string, approval?: string}>}
+   */
+  async setPermission(sessionId, payload) {
     try {
       const id = typeof sessionId === 'string' ? sessionId.trim() : '';
       if (id.length === 0) {
         throw new BridgeError(ErrorCode.INVALID_PARAM, '缺少 sessionId');
       }
-      if (typeof mode !== 'string' || !PERMISSION_MODES.includes(mode)) {
+      const options = payload !== null && typeof payload === 'object' ? payload : {};
+      const mode = typeof options.mode === 'string' ? options.mode.trim() : '';
+      const approval = typeof options.approval === 'string' ? options.approval.trim() : '';
+      if (mode.length === 0 && approval.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, 'PUT 需要 mode / approval 至少一项');
+      }
+      if (mode.length > 0 && !PERMISSION_MODES.includes(mode)) {
         throw new BridgeError(ErrorCode.INVALID_PARAM, 'mode 必须是 read-only / workspace-write / full-access 之一');
+      }
+      if (approval.length > 0 && !(approval in WIRE_TO_APPROVAL)) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, 'approval 必须是 every-step / auto 之一');
       }
       const query = this.require('sessionQuery');
       const snapshot = await query.readSession(id);
       if (snapshot === null || typeof snapshot !== 'object') {
         throw new BridgeError(ErrorCode.SESSION_NOT_FOUND, '会话不存在', { detail: { sessionId: id } });
       }
-      const service = this.optional('permissionPresets');
-      if (service === undefined || typeof service.set !== 'function') {
-        throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式（缺少 permissionPresets 服务）');
-      }
       const live = await this.resolveLiveSession(id);
       if (live === null) {
-        throw new BridgeError(ErrorCode.DSH_ERROR, '会话未在运行且无法唤起，无法修改权限模式', { detail: { sessionId: id } });
+        throw new BridgeError(ErrorCode.DSH_ERROR, '会话未在运行且无法唤起，无法修改权限', { detail: { sessionId: id } });
       }
-      const targetSandbox = MODE_TO_SANDBOX[mode];
-      let presetName = null;
-      const catalog = typeof service.catalog === 'function' ? this.readPermissionCatalog() : null;
-      if (catalog !== null && Array.isArray(catalog.options)) {
-        for (const option of catalog.options) {
-          const value = option !== null && typeof option === 'object' ? option.value : undefined;
-          if (typeof value !== 'string' || value === 'custom' || value === 'auto') continue;
-          try {
-            if (typeof service.resolve === 'function' && service.resolve(value).sandbox === targetSandbox) {
-              presetName = value;
-              break;
+      const result = { sessionId: id };
+      // 1) mode（沙盒/预设）先写：有匹配预设走 permissionPresets.set（顺带写预设自带的
+      //    approval），没有（默认部署的 read-only）直写 sandbox/mode 事件。
+      if (mode.length > 0) {
+        const service = this.optional('permissionPresets');
+        if (service === undefined || typeof service.set !== 'function') {
+          throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式（缺少 permissionPresets 服务）');
+        }
+        const targetSandbox = MODE_TO_SANDBOX[mode];
+        let presetName = null;
+        const catalog = typeof service.catalog === 'function' ? this.readPermissionCatalog() : null;
+        if (catalog !== null && Array.isArray(catalog.options)) {
+          for (const option of catalog.options) {
+            const value = option !== null && typeof option === 'object' ? option.value : undefined;
+            if (typeof value !== 'string' || value === 'custom' || value === 'auto') continue;
+            try {
+              if (typeof service.resolve === 'function' && service.resolve(value).sandbox === targetSandbox) {
+                presetName = value;
+                break;
+              }
+            } catch {
+              // 目录里不可解析的项跳过
             }
-          } catch {
-            // 目录里不可解析的项跳过
           }
         }
+        if (presetName !== null) {
+          service.set(live, presetName);
+        } else if (typeof live.append === 'function') {
+          live.append('sandbox/mode', { mode: targetSandbox });
+        } else {
+          throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式');
+        }
+        result.mode = mode;
       }
-      if (presetName !== null) {
-        service.set(live, presetName);
-      } else if (typeof live.append === 'function') {
-        live.append('sandbox/mode', { mode: targetSandbox });
-      } else {
-        throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改会话权限模式');
+      // 2) approval 后写：fold 取最后一条 approval/policy，显式选择覆盖预设默认。
+      //    [官方源码] dsh-user-approval/src/index.ts:117-122 setApprovalPolicy =
+      //    session.append('approval/policy', { policy })（'ask' | 'never'）。
+      if (approval.length > 0) {
+        if (typeof live.append !== 'function') {
+          throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前 DSH 版本不支持运行时修改审批策略');
+        }
+        live.append('approval/policy', { policy: WIRE_TO_APPROVAL[approval] });
+        result.approval = approval;
       }
-      return { sessionId: id, mode };
+      return result;
     } catch (error) {
       throw asBridgeError(error);
     }
