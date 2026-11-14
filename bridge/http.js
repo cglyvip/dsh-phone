@@ -24,6 +24,7 @@ import {
   sendJson,
 } from './errors.js';
 import send from 'send';
+import { TUNNEL_MODES } from './transport.js';
 
 /**
  * 隧道流量的 Host 头标记（与 cloudflare.js 的 TUNNEL_HOST_HEADER 一致）。
@@ -54,18 +55,22 @@ function matchRoute(routes, method, pathname) {
  *   eventHub: import('./eventhub.js').EventHub,
  *   tokens: import('./auth.js').TokenStore,
  *   pairing: import('./auth.js').PairingCode,
+ *   transport?: import('./transport.js').TransportManager,
+ *   transportPersistFile?: string,
  *   config: object,
  *   log: (msg: string) => void,
  * }} deps
  */
 export function createHttpHandler(deps) {
-  const { adapter, eventHub, tokens, pairing, config, log } = deps;
+  const { adapter, eventHub, tokens, pairing, transport, transportPersistFile, config, log } = deps;
 
   const routes = [
     { method: 'GET', pattern: /^\/api\/health$/, handler: handleHealth },
     { method: 'GET', pattern: /^\/api\/version$/, handler: handleVersion },
     { method: 'POST', pattern: /^\/api\/pair$/, handler: handlePair, open: true },
     { method: 'GET', pattern: /^\/api\/pairing-code$/, handler: handlePairingCode, open: true, loopbackOnly: true },
+    { method: 'GET', pattern: /^\/api\/transport$/, handler: handleTransportStatus },
+    { method: 'POST', pattern: /^\/api\/transport\/mode$/, handler: handleTransportSwitch, loopbackOnly: true },
     { method: 'GET', pattern: /^\/api\/sessions$/, handler: handleListSessions },
     { method: 'POST', pattern: /^\/api\/sessions$/, handler: handleCreateSession },
     { method: 'POST', pattern: /^\/api\/sessions\/batch-delete$/, handler: handleBatchDelete },
@@ -150,6 +155,35 @@ export function createHttpHandler(deps) {
       expiresAt: current.expiresAt,
       expiresInMs: Math.max(0, current.expiresAt - Date.now()),
     };
+  }
+
+  /** GET /api/transport（v3.2 §10）：公网通道状态（mode/url/error/每通道明细）。 */
+  async function handleTransportStatus() {
+    if (transport === undefined) {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前版本未启用通道管理');
+    }
+    return transport.status();
+  }
+
+  /**
+   * POST /api/transport/mode（v3.2 §10，仅本机）：一键切换公网通道，停旧起新。
+   * body: { "mode": "quick" | "named" | "frp" | "relay" | "off" }
+   * 选择持久化到 $DSH_HOME/phone-bridge/transport.json（重启后仍生效）。
+   */
+  async function handleTransportSwitch(params, request) {
+    if (transport === undefined) {
+      throw new BridgeError(ErrorCode.NOT_SUPPORTED, '当前版本未启用通道管理');
+    }
+    const body = await readJsonBody(request);
+    const mode = requireString(body, 'mode').trim();
+    if (!TUNNEL_MODES.includes(mode)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `tunnelMode 必须是 ${TUNNEL_MODES.join(' / ')} 之一`);
+    }
+    return transport.switchMode(mode, {
+      ...(typeof transportPersistFile === 'string' && transportPersistFile.length > 0
+        ? { persistFile: transportPersistFile }
+        : {}),
+    });
   }
 
   async function handleListSessions(params, request, query) {
@@ -375,10 +409,22 @@ export function createHttpHandler(deps) {
     });
   }
 
-  /** 判断请求是否来自本机 socket（隧道流量也是 127.0.0.1，所以必须再看 Host 标记）。 */
+  /** 判断请求是否来自本机 socket（隧道/frp 来源也是 127.0.0.1，所以必须再看 Host）。 */
   function isLoopback(request) {
     const address = request.socket !== null && request.socket !== undefined ? request.socket.remoteAddress : '';
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+  }
+
+  /**
+   * Host 是否指向回环地址（127.0.0.1 / localhost / [::1]，端口任意）。
+   * frp tcp 透传的 Host 是 vps:remotePort，局域网手机是 LAN IP:port——都不是回环，
+   * 因此「socket 回环 + Host 回环」能把本机用户与所有公网通道来源区分开。
+   */
+  function hostIsLoopback(request) {
+    const host = typeof request.headers.host === 'string' ? request.headers.host.trim().toLowerCase() : '';
+    if (host.length === 0) return false;
+    const hostPart = host.replace(/:\d+$/, '');
+    return hostPart === '127.0.0.1' || hostPart === 'localhost' || hostPart === '[::1]' || hostPart === '::1';
   }
 
   /** 判断请求是否经公网隧道进来（cloudflared --http-host-header 改写过的 Host）。 */
@@ -482,12 +528,16 @@ export function createHttpHandler(deps) {
 
     try {
       if (route.loopbackOnly === true) {
-        // 隧道流量从 127.0.0.1 连入，socket 层面与本机用户无法区分，
-        // 所以 loopback-only 接口同时拒绝隧道 Host（安全修复：配对码曾可经隧道获取）。
+        // 公网通道（cloudflared 快速/命名隧道、frp tcp 透传）的请求都从 127.0.0.1 连入，
+        // socket 层面与本机用户无法区分：
+        //   - quick 隧道：Host 被改写成 dsh-phone-bridge-tunnel → 显式拒绝
+        //   - frp tcp：Host 是 vps:remotePort → 非 Host 回环 → 拒绝
+        //   - 本机用户：Host 是 127.0.0.1[:port]/localhost[:port] → 放行
+        // 业务接口不受影响（各通道 + LAN 的 Bearer 请求全部正常放行）。
         if (isTunnelRequest(request)) {
           throw new BridgeError(ErrorCode.ROUTE_LOCAL_ONLY, '该接口不允许通过公网隧道访问');
         }
-        if (!isLoopback(request)) {
+        if (!isLoopback(request) || !hostIsLoopback(request)) {
           throw new BridgeError(ErrorCode.ROUTE_LOCAL_ONLY, '该接口仅限本机访问');
         }
       }

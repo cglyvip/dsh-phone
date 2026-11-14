@@ -48,6 +48,8 @@ function escapeHtml(text) {
  * 生成配对页 HTML。
  * @param {{
  *   lanUrl: string, publicUrl?: string, tunnelUrl?: string,
+ *   channels?: Record<string, {label: string, desc: string, status: string, url: string, error: string}>,
+ *   currentChannel?: string, transportApiPath?: string,
  *   port: number, clients: number, code: string, expiresAt: number,
  *   bridgeVersion: string, contractVersion: number,
  * }} info
@@ -56,18 +58,54 @@ export function pairHtml(info) {
   const lanUrl = typeof info.lanUrl === 'string' ? info.lanUrl : '';
   const publicUrl = typeof info.publicUrl === 'string' ? info.publicUrl : '';
   const tunnelUrl = typeof info.tunnelUrl === 'string' ? info.tunnelUrl : '';
+  const channels = info.channels !== null && typeof info.channels === 'object' ? info.channels : {};
+  const currentChannel = typeof info.currentChannel === 'string' ? info.currentChannel : 'off';
+  const transportApiPath = typeof info.transportApiPath === 'string' ? info.transportApiPath : '/api/transport/mode';
   const code = typeof info.code === 'string' ? info.code : '';
   const expiresAt = Number.isFinite(info.expiresAt) ? info.expiresAt : 0;
   const clients = Number.isFinite(info.clients) ? info.clients : 0;
   const bridgeVersion = typeof info.bridgeVersion === 'string' ? info.bridgeVersion : '';
   const contractVersion = Number.isFinite(info.contractVersion) ? info.contractVersion : 0;
 
-  const primaryUrl = publicUrl.length > 0 ? publicUrl : (tunnelUrl.length > 0 ? tunnelUrl : lanUrl);
+  const primaryUrl = publicUrl.length > 0 && (currentChannel === 'named' || currentChannel === 'relay')
+    ? publicUrl
+    : (tunnelUrl.length > 0 ? tunnelUrl : (publicUrl.length > 0 ? publicUrl : lanUrl));
   // 二维码里放一条完整的配对指令，App 扫到即可直接建连
   const qrPayload = `dsh-phone://pair?url=${encodeURIComponent(primaryUrl)}&code=${encodeURIComponent(code)}`;
   const svg = qrSvg(qrPayload, { cellSize: 5, margin: 3 });
 
   const remainingMinutes = expiresAt > 0 ? Math.max(0, Math.round((expiresAt - Date.now()) / 60000)) : 0;
+
+  // 公网通道选择区块（仅本机可见）：4 个通道卡片 = 当前态 + 一键切换 + 每通道错误原因
+  const STATUS_TEXT = {
+    running: ['运行中', 'ok'],
+    starting: ['连接中', 'wait'],
+    error: ['出错', 'err'],
+    stopped: ['已停止', 'idle'],
+    off: ['未启用', 'idle'],
+    reserved: ['未开放', 'idle'],
+  };
+  const channelOrder = ['quick', 'named', 'frp', 'relay'];
+  const channelCards = channelOrder.map((id) => {
+    const channel = channels[id] !== null && typeof channels[id] === 'object'
+      ? channels[id]
+      : { label: id, desc: '', status: 'off', url: '', error: '' };
+    const [statusText, statusKind] = STATUS_TEXT[channel.status] ?? [channel.status, 'idle'];
+    const active = id === currentChannel;
+    const stateLine = channel.url.length > 0
+      ? `<div class="ch-url">${escapeHtml(channel.url)}</div>`
+      : (channel.error.length > 0 ? `<div class="ch-err">${escapeHtml(channel.error)}</div>` : '');
+    return `
+    <div class="ch${active ? ' ch-active' : ''}" id="ch-${id}">
+      <div class="ch-head">
+        <span class="ch-name">${escapeHtml(channel.label ?? id)}</span>
+        <span class="st st-${statusKind}">${statusText}${active ? ' · 当前' : ''}</span>
+      </div>
+      <div class="ch-desc">${escapeHtml(channel.desc ?? '')}</div>
+      ${stateLine}
+      ${active ? '' : `<button class="ch-btn" data-mode="${id}"${channel.status === 'reserved' ? ' disabled' : ''}>切换到此通道</button>`}
+    </div>`;
+  }).join('\n');
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -121,6 +159,23 @@ export function pairHtml(info) {
     background: var(--brand); color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
   }
   button:active { background: var(--brand-deep); }
+  .ch { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .ch-active { border-color: var(--brand); background: var(--brand-soft); }
+  .ch-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .ch-name { font-weight: 600; font-size: 14px; }
+  .ch-desc { color: var(--text-2); font-size: 12px; margin-top: 2px; }
+  .ch-url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; margin-top: 6px; word-break: break-all; }
+  .ch-err { color: #DC2626; font-size: 12px; margin-top: 6px; word-break: break-all; }
+  .st { border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; flex: 0 0 auto; }
+  .st-ok { background: #DCFCE7; color: #15803D; }
+  .st-wait { background: var(--brand-soft); color: var(--brand-deep); }
+  .st-err { background: #FEE2E2; color: #B91C1C; }
+  .st-idle { background: var(--line); color: var(--text-2); }
+  .ch-btn {
+    margin-top: 8px; padding: 7px 10px; width: 100%; font-size: 13px;
+    border: none; border-radius: 9px; background: var(--brand); color: #fff; cursor: pointer;
+  }
+  .ch-btn:disabled { background: var(--line); color: var(--text-2); cursor: default; }
 </style>
 </head>
 <body>
@@ -141,6 +196,11 @@ export function pairHtml(info) {
     ${tunnelUrl ? `<div class="row"><span class="k">隧道地址</span><span class="v">${escapeHtml(tunnelUrl)}</span></div>` : ''}
     <div class="row"><span class="k">已连接手机</span><span class="v" id="clientCount">${clients}</span></div>
     <div class="row"><span class="k">桥版本</span><span class="v">v${escapeHtml(bridgeVersion)} · 契约 v${contractVersion}</span></div>
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:10px">公网通道（手机在外网也能连；任选其一，随时切换。建议：国内 VPS 用 frp 延迟最低，Named Tunnel 免维护，Quick 免费试用）</div>
+    ${channelCards}
   </div>
 
   <div class="card">
@@ -165,6 +225,31 @@ export function pairHtml(info) {
     } catch (e) {
       window.prompt('复制下面的地址：', primary);
     }
+  });
+  // 公网通道一键切换（仅本机）：POST /api/transport/mode → 停旧起新 → 刷新页面
+  document.querySelectorAll('.ch-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const mode = btn.getAttribute('data-mode');
+      btn.disabled = true;
+      btn.textContent = '切换中…';
+      try {
+        const res = await fetch(${JSON.stringify(transportApiPath)}, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => null);
+          btn.textContent = (data && data.error && data.error.message) ? data.error.message.slice(0, 60) : '切换失败';
+          btn.disabled = false;
+          return;
+        }
+        window.location.reload();
+      } catch (e) {
+        btn.textContent = '切换失败（网络错误）';
+        btn.disabled = false;
+      }
+    });
   });
   async function poll() {
     try {

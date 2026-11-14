@@ -24,9 +24,9 @@ import { TokenStore, PairingCode } from './bridge/auth.js';
 import { createHttpHandler } from './bridge/http.js';
 import { WsDataPlane } from './bridge/ws.js';
 import { EventHub } from './bridge/eventhub.js';
+import { TransportManager, TUNNEL_MODES, normalizeTransportConfig } from './bridge/transport.js';
 import { DshAdapter } from './adapter/dsh.js';
 import { lanAddress, pairHtml } from './pair.js';
-import { startQuickTunnel } from './cloudflare.js';
 
 export const name = 'dsh-phone-bridge';
 export const version = BRIDGE_VERSION;
@@ -46,6 +46,16 @@ const PORT_RETRY = 10;
 export function normalize(config) {
   const raw = config !== null && typeof config === 'object' ? config : {};
   const port = Number.isInteger(raw.port) ? raw.port : 8787;
+  // v3.2 通道选择：tunnelMode 显式配置优先；未配置时兼容旧 cloudflareTunnel:
+  //   startup → quick（原来就是启动即建 cloudflared 快速隧道），其余 → off（仅局域网）
+  let tunnelMode = 'off';
+  if (TUNNEL_MODES.includes(raw.tunnelMode)) {
+    tunnelMode = raw.tunnelMode;
+  } else if (raw.cloudflareTunnel === 'startup') {
+    tunnelMode = 'quick';
+  }
+  const frp = raw.frp !== null && typeof raw.frp === 'object' ? raw.frp : {};
+  const relay = raw.relay !== null && typeof raw.relay === 'object' ? raw.relay : {};
   return {
     enabled: raw.enabled !== false,
     host: typeof raw.host === 'string' && raw.host.length > 0 ? raw.host : '0.0.0.0',
@@ -59,6 +69,17 @@ export function normalize(config) {
       ? raw.cloudflareTunnel
       : 'off',
     cloudflaredPath: typeof raw.cloudflaredPath === 'string' ? raw.cloudflaredPath : 'cloudflared',
+    tunnelMode,
+    frp: {
+      serverAddr: typeof frp.serverAddr === 'string' ? frp.serverAddr : '',
+      serverPort: Number.isInteger(frp.serverPort) ? frp.serverPort : 7000,
+      token: typeof frp.token === 'string' ? frp.token : '',
+      remotePort: Number.isInteger(frp.remotePort) && frp.remotePort >= 0 ? frp.remotePort : 0,
+      useTls: frp.useTls === true,
+    },
+    relay: {
+      endpoint: typeof relay.endpoint === 'string' ? relay.endpoint : '',
+    },
     logLevel: typeof raw.logLevel === 'string' ? raw.logLevel : 'info',
     tokenFile: typeof raw.tokenFile === 'string' ? raw.tokenFile : '',
   };
@@ -66,10 +87,14 @@ export function normalize(config) {
 
 /** 令牌文件默认位置：$DSH_HOME/phone-bridge/tokens.json */
 function defaultTokenFile() {
-  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
+  return path.join(defaultTokenHome(), 'phone-bridge', 'tokens.json');
+}
+
+/** DSH home 目录（frpc 托管与 transport.json 都落在它的 phone-bridge/ 下）。 */
+function defaultTokenHome() {
+  return typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
     ? process.env.DSH_HOME
     : path.join(os.homedir(), '.dsh');
-  return path.join(home, 'phone-bridge', 'tokens.json');
 }
 
 /** 在指定端口上监听，被占用时依次 +1 重试。 */
@@ -129,14 +154,46 @@ export function apply(ctx, config) {
       port: 0,
       server: null,
       wsPlane: null,
-      tunnel: null,
-      tunnelUrl: '',
-      tunnelPromise: null,
     };
 
     eventHub.attach(ctx);
 
-    const httpHandler = createHttpHandler({ adapter, eventHub, tokens, pairing, config: cfg, log });
+    // 公网通道状态机（contract §10）：配置 = 桥 config + transport.json 覆盖
+    //（配对页切换通道时写 transport.json，优先级高于插件 config 的 tunnelMode）
+    const transportOverrideFile = path.join(path.dirname(tokenFile), 'transport.json');
+    let transportOverrides = {};
+    try {
+      if (fs.existsSync(transportOverrideFile)) {
+        const parsed = JSON.parse(fs.readFileSync(transportOverrideFile, 'utf8'));
+        if (parsed !== null && typeof parsed === 'object' && TUNNEL_MODES.includes(parsed.tunnelMode)) {
+          transportOverrides = { tunnelMode: parsed.tunnelMode };
+        }
+      }
+    } catch (error) {
+      log(`transport.json 读取失败（按桥配置执行）: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transport = new TransportManager({
+      config: normalizeTransportConfig({
+        tunnelMode: transportOverrides.tunnelMode ?? cfg.tunnelMode,
+        publicUrl: cfg.publicUrl,
+        cloudflaredPath: cfg.cloudflaredPath,
+        frp: cfg.frp,
+        relay: cfg.relay,
+      }),
+      home: defaultTokenHome(),
+      log,
+    });
+
+    const httpHandler = createHttpHandler({
+      adapter,
+      eventHub,
+      tokens,
+      pairing,
+      transport,
+      transportPersistFile: transportOverrideFile,
+      config: cfg,
+      log,
+    });
 
     /** 统一的 HTTP 服务器：/health、/pair、/ 以及 /api/** */
     const server = http.createServer((request, response) => {
@@ -153,6 +210,7 @@ export function apply(ctx, config) {
       if (pathname === '/health' || pathname === '/api/health') {
         const hello = eventHub.helloPayload();
         const lan = lanAddress();
+        const transportStatus = transport.status();
         sendJson(response, 200, {
           status: 'ok',
           plugin: name,
@@ -164,7 +222,11 @@ export function apply(ctx, config) {
           port: state.port,
           lanUrl: lan.length > 0 ? `ws://${lan}:${state.port}` : '',
           publicUrl: cfg.publicUrl,
-          tunnelUrl: state.tunnelUrl,
+          tunnelMode: transportStatus.tunnelMode,
+          tunnelStatus: transportStatus.tunnelStatus,
+          tunnelUrl: transportStatus.tunnelUrl,
+          tunnelError: transportStatus.tunnelError,
+          channels: transportStatus.channels,
           clients: state.wsPlane !== null ? state.wsPlane.clients.size : 0,
           cursor: eventHub.currentCursor(),
           pairingMode: cfg.pairingMode,
@@ -178,28 +240,33 @@ export function apply(ctx, config) {
           ? request.socket.remoteAddress
           : '';
         const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-        // 隧道流量（cloudflared --http-host-header 改写 Host）从 127.0.0.1 连入，
-        // socket 层面与本机无法区分；配对页展示配对码，绝不允许隧道访问。
+        // 隧道/frp 来源都从 127.0.0.1 连入，socket 层面与本机无法区分；
+        // 配对页展示配对码，只允许「socket 回环 + Host 指向回环地址」的请求打开。
         const host = typeof request.headers.host === 'string' ? request.headers.host.trim().toLowerCase() : '';
-        const isTunnel = host === 'dsh-phone-bridge-tunnel';
-        if (isTunnel) {
+        const hostPart = host.replace(/:\d+$/, '');
+        const hostIsLoopback = hostPart === '127.0.0.1' || hostPart === 'localhost' || hostPart === '[::1]' || hostPart === '::1';
+        if (host === 'dsh-phone-bridge-tunnel') {
           sendText(response, 403, '配对页不允许通过公网隧道访问');
           return;
         }
-        if (!isLoopback) {
+        if (!isLoopback || !hostIsLoopback) {
           sendText(response, 403, '配对页只允许在电脑本机打开');
           return;
         }
         const current = pairing.current();
         const lan = lanAddress();
         const lanUrl = lan.length > 0 ? `ws://${lan}:${state.port}` : '';
+        const transportStatus = transport.status();
         sendText(
           response,
           200,
           pairHtml({
             lanUrl,
             publicUrl: cfg.publicUrl,
-            tunnelUrl: state.tunnelUrl,
+            tunnelUrl: transportStatus.tunnelUrl,
+            channels: transportStatus.channels,
+            currentChannel: transportStatus.tunnelMode,
+            transportApiPath: '/api/transport/mode',
             port: state.port,
             clients: state.wsPlane !== null ? state.wsPlane.clients.size : 0,
             code: current.code,
@@ -258,42 +325,16 @@ export function apply(ctx, config) {
           log(`写运行时信息失败: ${error instanceof Error ? error.message : String(error)}`);
         }
 
-        if (cfg.cloudflareTunnel === 'startup') {
-          void ensureTunnel().catch(() => { /* 隧道失败已在内部记日志，不致命 */ });
+        if (cfg.tunnelMode !== 'off') {
+          // 公网通道（quick/named/frp/relay）：失败降级局域网，LAN 永远可用
+          void transport.start({ localPort: port }).catch((error) => {
+            log(`公网通道启动失败（已降级局域网）: ${error instanceof Error ? error.message : String(error)}`);
+          });
         }
       } catch (error) {
         log(`启动失败: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-
-    const ensureTunnel = () => {
-      if (state.tunnelPromise !== null) return state.tunnelPromise;
-      state.tunnelPromise = startQuickTunnel({
-        bridgePort: state.port,
-        targetHost: '127.0.0.1',
-        command: cfg.cloudflaredPath,
-        timeoutMs: 60_000,
-        log,
-        onExit: () => {
-          state.tunnelUrl = '';
-          state.tunnel = null;
-          state.tunnelPromise = null;
-        },
-      }).then((tunnel) => {
-        state.tunnel = tunnel;
-        state.tunnelUrl = tunnel.url;
-        log(`Cloudflare 隧道已就绪: ${tunnel.url}`);
-        return tunnel;
-      }).catch((error) => {
-        state.tunnelPromise = null;
-        log(`隧道启动失败: ${error instanceof Error ? error.message : String(error)}`);
-        throw asBridgeError(error);
-      });
-      return state.tunnelPromise;
-    };
-
-    // 让后续逻辑能触达隧道
-    state.ensureTunnel = ensureTunnel;
 
     void boot();
 
@@ -315,7 +356,8 @@ export function apply(ctx, config) {
         // 忽略
       }
       try {
-        state.tunnel?.stop?.();
+        // 停掉公网通道进程（cloudflared / frpc）——随桥 dispose 全部回收
+        void transport.stop();
       } catch (error) {
         // 忽略
       }

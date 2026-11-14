@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,9 +19,106 @@ import { WebSocket } from 'ws';
 
 import { apply, normalize } from './index.js';
 import { projectEvents } from './adapter/project.js';
+import { buildFrpcConfig, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
+import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+// ── v3.2 §10 frp 托管测试工具 ──────────────────────────────────────────────
+
+function crc32Of(buffer) {
+  let crc = -1;
+  for (let i = 0; i < buffer.length; i += 1) {
+    crc ^= buffer[i];
+    for (let k = 0; k < 8; k += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+/** 构造一个最小 zip（stored 方法，含中央目录 + EOCD），装着 frpc.exe。 */
+function makeZip(entries) {
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const nameBytes = Buffer.from(entry.name, 'utf8');
+    const crc = crc32Of(entry.data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(entry.data.length, 18);
+    local.writeUInt32LE(entry.data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    chunks.push(local, nameBytes, entry.data);
+    const cen = Buffer.alloc(46);
+    cen.writeUInt32LE(0x02014b50, 0);
+    cen.writeUInt16LE(20, 4);
+    cen.writeUInt16LE(20, 6);
+    cen.writeUInt32LE(crc, 16);
+    cen.writeUInt32LE(entry.data.length, 20);
+    cen.writeUInt32LE(entry.data.length, 24);
+    cen.writeUInt16LE(nameBytes.length, 28);
+    cen.writeUInt32LE(offset, 42);
+    central.push(cen, nameBytes);
+    offset += 30 + nameBytes.length + entry.data.length;
+  }
+  const cdStart = offset;
+  const cdSize = central.reduce((sum, part) => sum + part.length, 0);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cdSize, 12);
+  eocd.writeUInt32LE(cdStart, 16);
+  return Buffer.concat([...chunks, ...central, eocd]);
+}
+
+/** frpc mock 子进程工厂：先吐日志行，exitAfterMs 后崩溃退出。 */
+function makeFrpcSpawner({ lines, exitAfterMs = 40 }) {
+  const spawns = [];
+  return {
+    spawns,
+    spawnImpl: (command, args) => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 40000 + spawns.length;
+      child.killed = false;
+      child.kill = () => {
+        if (!child.killed) {
+          child.killed = true;
+          queueMicrotask(() => child.emit('exit', 0));
+        }
+        return true;
+      };
+      spawns.push({ command, args, pid: child.pid });
+      queueMicrotask(() => {
+        for (const line of lines) child.stdout.emit('data', Buffer.from(`${line}\n`));
+        if (exitAfterMs >= 0) {
+          const timer = setTimeout(() => {
+            if (!child.killed) child.emit('exit', 1);
+          }, exitAfterMs);
+          if (typeof timer.unref === 'function') timer.unref();
+        }
+      });
+      return child;
+    },
+  };
+}
+
+async function waitForCondition(getValue, expect, timeoutMs = 8000, label = '条件') {
+  const started = Date.now();
+  for (;;) {
+    const value = getValue();
+    if (expect(value)) return value;
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`等待 ${label} 超时（当前 ${JSON.stringify(value)}）`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 // ── 假 DSH 服务 ────────────────────────────────────────────────────────────
 
@@ -390,7 +488,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.1.0');
+  assert.equal(health.json.bridgeVersion, '3.2.0');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -501,7 +599,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.1.0');
+  assert.equal(hello.payload.bridgeVersion, '3.2.0');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -1110,6 +1208,240 @@ async function main() {
   assert.equal(pairPage.status, 200);
   assert.ok(pairPage.text.includes('配对码'));
   pass('GET /pair 配对页');
+
+  // 24) v3.2 §10 frp：frpc.toml 配置生成 + token 不落日志
+  const frpToken = 'vps-secret-token-3.2';
+  const frpLogs = [];
+  const frpLog = (msg) => frpLogs.push(msg);
+  const { toml, proxyName } = buildFrpcConfig({
+    serverAddr: '203.0.113.10',
+    serverPort: 7000,
+    token: frpToken,
+    remotePort: 34567,
+    useTls: true,
+    localPort: 8787,
+  });
+  assert.equal(proxyName, 'dsh-phone-bridge');
+  assert.ok(toml.includes('serverAddr = "203.0.113.10"'));
+  assert.ok(toml.includes('serverPort = 7000'));
+  assert.ok(toml.includes('auth.method = "token"'));
+  assert.ok(toml.includes(`auth.token = "${frpToken}"`), 'token 必须写进 frpc.toml');
+  assert.ok(toml.includes('transport.tls.enabled = true'));
+  assert.ok(toml.includes('localIP = "127.0.0.1"'));
+  assert.ok(toml.includes('localPort = 8787'));
+  assert.ok(toml.includes('remotePort = 34567'));
+  assert.ok(toml.includes('[[proxies]]'));
+  const noRemote = buildFrpcConfig({ serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 0, useTls: false, localPort: 8787 }).toml;
+  assert.ok(!noRemote.includes('remotePort'), 'remotePort=0 应省略该键（由 frps 分配）');
+  assert.ok(!noRemote.includes('transport.tls.enabled = true'));
+  frpLog('生成配置示例');
+  const logBlob = frpLogs.join('\n');
+  assert.ok(!logBlob.includes(frpToken), 'token 绝不进日志');
+  const frpcDirA = join(tmpDir, 'phone-bridge', 'frpc-a');
+  const writtenPath = writeFrpcConfig(frpcDirA, toml);
+  assert.ok(existsSync(writtenPath), 'frpc.toml 应写入 frpc 目录');
+  assert.equal(writtenPath, join(frpcDirA, 'frpc.toml'));
+  pass('frp 配置生成（官方 TOML 键 + remotePort=0 省略 + token 不落日志）');
+
+  // 25) v3.2 §10 frp：下载产物 size/sha256 双校验（拒绝篡改）
+  const frpcPayload = Buffer.from('MOCK-FRPC-EXE-3.2.0-PAYLOAD', 'utf8');
+  const releaseZip = makeZip([
+    { name: `frp_${frpReleaseInfo().tag}_windows_amd64/frpc.exe`, data: frpcPayload },
+  ]);
+  const expected = { size: releaseZip.length, sha256: crypto.createHash('sha256').update(releaseZip).digest('hex') };
+  verifyReleaseAsset(releaseZip, expected); // 合法：不抛
+  let tampered = Buffer.from(releaseZip);
+  tampered[100] = (tampered[100] + 1) % 256;
+  assert.throws(() => verifyReleaseAsset(tampered, expected), /sha256 不符/, '篡改产物必须被 sha256 拒绝');
+  assert.throws(() => verifyReleaseAsset(releaseZip, { size: expected.size + 1, sha256: expected.sha256 }), /字节数不符/, '尺寸不符必须被拒绝');
+  assert.throws(() => verifyReleaseAsset(releaseZip, { size: expected.size, sha256: '' }), /sha256 元数据/, '缺 sha256 元数据必须拒绝落盘');
+  pass('frp 下载产物 size/sha256 双校验（篡改 / 尺寸不符 / 缺元数据全部拒绝）');
+
+  // 25b) ensureFrpcBinary 端到端：合法 zip 抽出 frpc.exe 落盘；篡改时拒绝落盘
+  const frpcDirB = join(tmpDir, 'phone-bridge', 'frpc-b');
+  const installed = await ensureFrpcBinary({
+    frpcDir: frpcDirB,
+    log: frpLog,
+    fetchJson: async () => ({
+      assets: [{
+        name: frpReleaseInfo().asset,
+        size: releaseZip.length,
+        digest: `sha256:${expected.sha256}`,
+        browser_download_url: 'https://example.invalid/frp.zip',
+      }],
+    }),
+    fetchBuffer: async () => releaseZip,
+  });
+  assert.equal(installed.source, 'managed');
+  assert.equal(readFileSync(installed.exePath).toString(), frpcPayload.toString(), 'zip 内 frpc.exe 应被抽出落盘');
+  const frpcDirC = join(tmpDir, 'phone-bridge', 'frpc-c');
+  await assert.rejects(
+    () => ensureFrpcBinary({
+      frpcDir: frpcDirC,
+      fetchJson: async () => ({ assets: [{ name: frpReleaseInfo().asset, size: releaseZip.length, digest: `sha256:${expected.sha256}`, browser_download_url: 'x' }] }),
+      fetchBuffer: async () => tampered,
+    }),
+    /sha256 不符/,
+  );
+  assert.ok(!existsSync(join(frpcDirC, 'frpc.exe')), '校验不过绝不落盘');
+  // 用户手放优先：目录里已有 frpc.exe 时直接使用，不触发下载
+  const frpcDirD = join(tmpDir, 'phone-bridge', 'frpc-d');
+  mkdirSync(frpcDirD, { recursive: true });
+  writeFileSync(join(frpcDirD, 'frpc.exe'), 'USER-FRPC');
+  const userPlaced = await ensureFrpcBinary({
+    frpcDir: frpcDirD,
+    fetchJson: async () => { throw new Error('不应触发下载'); },
+    fetchBuffer: async () => { throw new Error('不应触发下载'); },
+  });
+  assert.equal(userPlaced.source, 'user');
+  assert.equal(readFileSync(userPlaced.exePath).toString(), 'USER-FRPC', '用户手放的 frpc 不被覆盖');
+  pass('frpc 自动引导（合法落盘 / 篡改拒绝落盘 / 用户手放优先）');
+
+  // 26) v3.2 §10 frp：frpc 崩溃重启策略（指数退避，最多 5 次）
+  const frpcHomeE = mkdtempSync(join(tmpdir(), 'dsh-bridge-frp-e-'));
+  mkdirSync(join(frpcHomeE, 'phone-bridge', 'frpc'), { recursive: true });
+  writeFileSync(join(frpcHomeE, 'phone-bridge', 'frpc', 'frpc.exe'), 'USER-FRPC');
+  const crashSpawner = makeFrpcSpawner({
+    lines: ['2026/11/14 10:00:00 [I] [proxy] login to server success', '2026/11/14 10:00:00 [I] [proxy] [dsh-phone-bridge] start proxy success'],
+    exitAfterMs: 30,
+  });
+  const transportE = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 0, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: crashSpawner.spawnImpl,
+    backoffBaseMs: 20,
+  });
+  await transportE.start({ localPort: 8787 });
+  const crashedStatus = await waitForCondition(
+    () => transportE.status(),
+    (value) => value.tunnelStatus === 'error' && value.tunnelError.includes('已停止重试'),
+    8000,
+    'frpc 连续崩溃 5 次后停止重试',
+  );
+  assert.ok(crashSpawner.spawns.length === 6, `初始 1 次 + 重启 5 次（实际 spawn ${crashSpawner.spawns.length} 次）`);
+  assert.equal(crashedStatus.channels.frp.restarts, 5);
+  await transportE.stop();
+  pass('frpc 崩溃重启策略（指数退避最多 5 次，超过降级局域网）');
+
+  // 26b) 正常 frpc：代理成功 → running，remotePort=0 时从 frps 分配结果回填 publicUrl
+  const okSpawner = makeFrpcSpawner({
+    lines: [
+      '2026/11/14 10:00:00 [I] [sub/root] login to server success',
+      '2026/11/14 10:00:00 [I] [proxy] [dsh-phone-bridge] start proxy success remoteAddr=203.0.113.10:34567',
+    ],
+    exitAfterMs: -1, // 常驻
+  });
+  const transportF = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 0, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: okSpawner.spawnImpl,
+    backoffBaseMs: 20,
+  });
+  await transportF.start({ localPort: 8787 });
+  const runningStatus = await waitForCondition(
+    () => transportF.status(),
+    (value) => value.tunnelStatus === 'running',
+    4000,
+    'frp 通道 running',
+  );
+  assert.equal(runningStatus.tunnelUrl, 'http://203.0.113.10:34567', 'remotePort=0 时应从 frps 分配结果回填 publicUrl');
+  assert.ok(!JSON.stringify(runningStatus).includes(frpToken), '状态快照不携带 token');
+  assert.ok(!frpLogs.join('\n').includes(frpToken), 'frpc 托管全程日志不含 token');
+  await transportF.stop();
+  assert.ok(okSpawner.spawns.every((item) => item.command.endsWith('frpc.exe') || item.command.includes('frpc')), 'spawn 的是 frpc 二进制');
+  assert.ok(okSpawner.spawns[0].args.includes('-c'), 'frpc 启动参数带 -c 配置路径');
+  pass('frp 通道运行态（frps 分配端口回填 publicUrl + token 不入状态/日志）');
+
+  // 27) v3.2 §10：通道统一状态机切换（停旧起新 + 持久化 + 失败降级）
+  let quickStopped = 0;
+  const quickStarter = async () => {
+    return {
+      url: 'https://demo.trycloudflare.com',
+      stop: () => {
+        quickStopped += 1;
+      },
+    };
+  };
+  const transportG = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'quick',
+      publicUrl: 'https://dsh.example.com',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 34567, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    quickStarter,
+    spawnImpl: makeFrpcSpawner({
+      lines: ['2026/11/14 10:00:00 [I] [proxy] [dsh-phone-bridge] start proxy success remotePort=34567'],
+      exitAfterMs: -1,
+    }).spawnImpl,
+  });
+  await transportG.start({ localPort: 8787 });
+  await waitForCondition(() => transportG.status(), (value) => value.tunnelStatus === 'running' && value.tunnelUrl === 'https://demo.trycloudflare.com', 3000, 'quick 通道');
+  const switchNamed = await transportG.switchMode('named', { persistFile: join(frpcHomeE, 'phone-bridge', 'transport.json') });
+  assert.equal(quickStopped, 1, '停旧：旧通道（quick）应被 stop');
+  assert.equal(switchNamed.tunnelMode, 'named');
+  assert.equal(switchNamed.tunnelUrl, 'https://dsh.example.com');
+  const persisted = JSON.parse(readFileSync(join(frpcHomeE, 'phone-bridge', 'transport.json'), 'utf8'));
+  assert.equal(persisted.tunnelMode, 'named', '切换选择应持久化到 transport.json');
+  const switchFrp = await transportG.switchMode('frp');
+  assert.equal(switchFrp.tunnelMode, 'frp');
+  assert.equal(switchFrp.tunnelUrl, 'http://203.0.113.10:34567', 'frp 固定 remotePort 时直接回填');
+  assert.equal(Object.keys(switchFrp.channels).length, 4, '四通道卡片状态齐全');
+  const switchOff = await transportG.switchMode('off');
+  assert.equal(switchOff.tunnelStatus, 'off');
+  assert.ok(!JSON.stringify(switchOff.channels).includes(frpToken), '通道卡片不携带 token');
+  await assert.rejects(() => transportG.switchMode('bogus'), /tunnelMode 必须是/);
+  assert.equal(normalizeTransportConfig({ tunnelMode: 'bogus' }).tunnelMode, 'off', '非法 mode 归一化为 off');
+  await transportG.stop();
+  pass('通道统一状态机（quick→named→frp→off 停旧起新 + 持久化 + 非法 mode 拒绝）');
+
+  // 27b) named 模式缺 publicUrl → 通道报错降级 LAN
+  const transportH = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'named', publicUrl: '' }),
+    home: frpcHomeE,
+    log: frpLog,
+  });
+  await transportH.start({ localPort: 8787 });
+  const namedError = transportH.status();
+  assert.equal(namedError.tunnelStatus, 'error');
+  assert.ok(namedError.tunnelError.includes('publicUrl'), '缺 publicUrl 应给出可读错误');
+  assert.equal(namedError.channels.frp.status, 'off', '其它通道不受影响');
+  await transportH.stop();
+  // relay 占位
+  const transportI = new TransportManager({
+    config: normalizeTransportConfig({ tunnelMode: 'relay', relay: { endpoint: '' } }),
+    home: frpcHomeE,
+    log: frpLog,
+  });
+  await transportI.start({ localPort: 8787 });
+  assert.equal(transportI.status().tunnelStatus, 'reserved', 'relay 本期仅占位展示');
+  await transportI.stop();
+  pass('named 缺 publicUrl 报错降级 / relay 占位展示');
+
+  // 28) v3.2 §10：HTTP 通道路由（GET /api/transport + POST /api/transport/mode）
+  const transportGet = await request(port, 'GET', '/api/transport', { token });
+  assert.equal(transportGet.status, 200);
+  assert.equal(transportGet.json.tunnelMode, 'off');
+  assert.ok(transportGet.json.channels !== undefined && transportGet.json.channels.quick !== undefined, '四通道卡片进响应');
+  const transportSwitch = await request(port, 'POST', '/api/transport/mode', { token, body: { mode: 'off' } });
+  assert.equal(transportSwitch.status, 200);
+  assert.equal(transportSwitch.json.tunnelMode, 'off');
+  const persistedFile = join(tmpDir, 'transport.json');
+  assert.ok(existsSync(persistedFile), '切换选择应持久化 transport.json');
+  const badMode = await request(port, 'POST', '/api/transport/mode', { token, body: { mode: 'bogus' } });
+  assert.equal(badMode.status, 400, '非法 mode → 400 INVALID_PARAM');
+  const loopbackOnlySwitch = await request(port, 'POST', '/api/transport/mode', { token });
+  assert.equal(loopbackOnlySwitch.status, 400, '缺 mode → 400 INVALID_PARAM');
+  pass('HTTP 通道路由（状态查询 / 一键切换 / 持久化 / 非法参数）');
 
   console.log(`\n✅ 冒烟测试全部通过（${passed} 项）`);
   cleanup();

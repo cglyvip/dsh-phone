@@ -1,5 +1,43 @@
 ﻿# CHANGELOG
 
+## 3.2.0（2026-11-14）
+
+### 新增（contract §10：公网接入多通道，用户自选）
+
+- **通道统一状态机**（`bridge/transport.js`）：`tunnelMode = quick | named | frp | relay | off`，
+  `switchMode` 停旧起新；任一通道失败自动降级局域网（LAN 永远可用）。
+  状态（`tunnelMode` / `tunnelStatus` / `tunnelUrl` / `tunnelError` / 四通道 `channels`）
+  全部进 `/api/health`、`GET /api/transport`；`POST /api/transport/mode`（仅本机）
+  一键切换并把选择持久化到 `$DSH_HOME/phone-bridge/transport.json`（重启仍生效）。
+  旧 `cloudflareTunnel: startup` 配置自动映射为 `tunnelMode: quick`（向后兼容）
+- **frp 通道**（自有 VPS，国内延迟最低）：
+  - frpc 自动引导（`bridge/frpc.js`）：写死官方 GitHub releases（fatedier/frp，
+    锁定 v0.61.1，`DSH_FRP_VERSION` 可覆盖），下载后 **size + sha256 双校验**
+    （元数据取 GitHub release assets，缺 digest 时退官方 checksums 文件），再从
+    zip 抽出 frpc.exe（解压后 CRC32 复核）——校验不过绝不落盘；
+    用户手放在 `~/.dsh/phone-bridge/frpc/frpc.exe` 的二进制永远优先、不覆盖
+  - `frpc.toml` 自动生成（官方键：serverAddr/serverPort/auth.method=token/
+    auth.token/transport.tls.enabled/[[proxies]] tcp→127.0.0.1:桥端口），
+    token 只写配置文件（权限 600），**永不进日志/状态/健康检查**；
+    `remotePort=0` 时从 frpc 输出的 frps 分配结果（remoteAddr=...）回填
+    `publicUrl = vps:port`
+  - frpc 进程生命周期：随桥 dispose 回收；崩溃自动重启（指数退避 1s/2s/4s/8s/16s，
+    最多 5 次，超过报错降级局域网）
+  - 安全：frp tcp 透传时 Host 是 `vps:remotePort`（非回环），仅本机路由判定从
+    「socket 回环」加严为「socket 回环 + Host 回环」——frp/各隧道来源的业务接口
+    照常放行，pairing-code 与 /pair 页对一切非本机直连 403（与 quick 隧道同一策略）
+- **配对页通道选择**（仅本机）：4 个通道卡片（quick/named/frp/relay）显示当前态、
+  一键切换、每通道错误原因与地址，含选型建议（frp 延迟最低 / named 免维护 /
+  quick 免费试用）
+- **relay**：本期仅配置占位（`relay.endpoint`）+ 通道状态展示，订阅连接逻辑下一阶段
+
+### 说明
+
+- `named` 通道不做自动建隧道（CF 后台一次性配置是用户自己的事），只透传 `publicUrl`
+- 冒烟测试 48 → **56 项**（frp 配置生成/双校验拒绝篡改/崩溃重启策略/通道状态机切换/
+  用户手放优先/HTTP 通道路由等；frpc 用 mock 进程，不需要真 frps）
+- 包版本与 `BRIDGE_VERSION` 升至 **3.2.0**；`CONTRACT_VERSION` 仍为 3
+
 ## 3.1.0（2026-11-14）
 
 ### 新增
