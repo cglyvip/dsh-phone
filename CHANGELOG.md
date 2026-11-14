@@ -1,5 +1,45 @@
 ﻿# CHANGELOG
 
+## 3.5.0（2026-11-15）
+
+### 新增（contract §3.1：会话列表「最后一条消息预览」）
+
+- **GET /api/sessions 的 items 每项新增两个字段**：
+  - `preview`：最后一条 user/assistant 消息的单行摘要（连续空白折叠、
+    按 Unicode 码点截 60 字、超长补 `…`；无消息为空串）
+  - `lastRole`：该消息角色 `'user' | 'assistant'`（无消息为 `''`）
+- **占位符规则**（preview 由内容块生成）：image/video/file/toolCall 块 →
+  `[图片]` / `[视频]` / `[文件]` / `[工具调用]`；reasoning 块不进预览；
+  tool/system/developer 消息不算（lastRole 契约只有两值）
+- **原生能力核实结论**（app.asar，DSH 0.2.2-rc.1）：DSH 不带该数据——
+  - `sessionController.list()`（dsh-api-session-controller/lib/index.js
+    `summaryFor()`，:2824 附近）只回 sessionId/updatedAt/agentAvailable/
+    formatStatus/running/blank/listFields/projections；
+    `sessionProjections` 仅有 sessionListMetadata（blank/lastPromptAt）、
+    imageLimits（summary:false）、conversationContinuation（续跑资格）三个键
+  - `sessionQuery.listSessions()`（dsh-session-query/lib/index.js:95）只回
+    header + live/persisted/formatStatus；`readTitleSnapshots` 只折 title
+  - `dsh-session-query-sqlite`（lib/index.ts:268-296）只暴露 searchSessions/
+    searchEvents（FTS5 检索 + snippet），没有 lastMessage/preview 列
+- **实现（桥内存缓存）**：
+  - `adapter/project.js` 新增 `toPreviewText` / `previewOfBlocks` /
+    `lastChatMessage` 纯函数（smoke 直接单测）
+  - `adapter/dsh.js` 维护 `Map<sessionId,{text,role,seq}>`：
+    `message.created` / `message.done` 事件实时更新（index.js 把
+    EventHub 订阅喂给 `adapter.observePreviewEvent`，dshSeq 单调保护
+    防乱序回退）；启动 `warmPreviewCache()` 对列表前 20 个会话用
+    `getHistoryPage({turns:1})` 批量补齐；列表请求时对缓存缺失的前 20 个
+    后台补齐（单飞队列 + 去重，不阻塞响应）；缓存上限 1000 条 FIFO
+- 兼容性：纯增量字段，`CONTRACT_VERSION` 仍为 3；桥刚启动的短暂窗口内
+  preview 可能为空串（契约 §3.1 已注记，App 需容忍）
+
+### 说明
+
+- 冒烟测试新增 3 项：preview 生成（启动补齐 + 60 字截断 + 空会话空串）、
+  事件实时更新（message.created 后列表立即反映）、previewOfBlocks 占位符
+- 包版本与 `BRIDGE_VERSION` 升至 **3.5.0**；`CONTRACT_VERSION` 仍为 3
+
+
 ## 3.4.0（2026-11-15）
 
 ### 新增（contract §9.6：审批策略可写）

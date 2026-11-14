@@ -163,6 +163,16 @@ export function apply(ctx, config) {
 
     eventHub.attach(ctx);
 
+    // v3.5：规范化事件 → 会话列表预览缓存（message.created/message.done 实时更新
+    // 最后一条消息，contract.md §3.1 preview/lastRole）
+    eventHub.subscribe((envelope) => {
+      try {
+        adapter.observePreviewEvent(envelope);
+      } catch {
+        // 预览缓存更新失败不影响事件分发
+      }
+    });
+
     // 公网通道状态机（contract §10）：配置 = 桥 config + transport.json 覆盖
     //（配对页切换通道时写 transport.json，优先级高于插件 config 的 tunnelMode）
     const transportOverrideFile = path.join(path.dirname(tokenFile), 'transport.json');
@@ -316,6 +326,9 @@ export function apply(ctx, config) {
         const lan = lanAddress();
         log(`已启动: http://${cfg.host}:${port}  (局域网 ws://${lan}:${port})`);
         log(`配对页: http://127.0.0.1:${port}/pair  当前配对码: ${pairing.current().code}`);
+
+        // v3.5：启动时对列表前 20 个会话批量补齐「最后一条消息预览」（后台执行）
+        void adapter.warmPreviewCache();
 
         // 运行时信息落盘，供 /pair 斜杠命令读取（端口可能被 +1 重试过）
         try {

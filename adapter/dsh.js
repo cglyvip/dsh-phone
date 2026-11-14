@@ -13,7 +13,7 @@
  */
 
 import { BridgeError, ErrorCode, asBridgeError } from '../bridge/errors.js';
-import { pageByTurns, projectEvents } from './project.js';
+import { lastChatMessage, pageByTurns, previewOfBlocks, projectEvents } from './project.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -31,6 +31,12 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 9;
 
 /** v3.1：批量硬删一次最多处理的会话数（contract.md §9.3）。 */
 const MAX_BATCH_DELETE = 200;
+
+/** v3.5：会话列表预览补齐只覆盖列表前 N 个（contract.md §3.1 preview 注记）。 */
+const PREVIEW_BACKFILL_LIMIT = 20;
+
+/** v3.5：预览缓存上限（防长期运行无限增长；超出按插入序淘汰）。 */
+const PREVIEW_CACHE_LIMIT = 1000;
 
 /**
  * v3.1 §9.5 会话权限 3 档 ↔ DSH 旋钮值的映射。
@@ -271,6 +277,18 @@ export class DshAdapter {
     this.pinnedIds = new Set();
     this.workspaceOrder = [];
     this._watchAbort = null;
+    // v3.5：会话列表「最后一条消息预览」。DSH 的 sessionController.list() /
+    // sessionQuery.listSessions() 都不带 lastMessage/preview 列（app.asar 源码核实：
+    // dsh-api-session-controller/lib/index.js summaryFor() 只有 sessionId/updatedAt/
+    // agentAvailable/formatStatus/running/blank/listFields/projections；sessionQuery
+    // 只回 header），dsh-session-query-sqlite 是 FTS5 搜索引擎（只有 searchSessions/
+    // searchEvents），所以预览由桥自维护：事件实时更新 + 启动/列表时批量补齐。
+    this.previewCache = new Map();
+    this._previewQueue = [];
+    this._previewQueued = new Set();
+    this._previewInFlight = new Set();
+    this._previewDrainPromise = null;
+    this._previewWarmed = false;
     // 手机端选择的默认模型。DSH 的 agentDefaultModel.saveSelection() 在插件内调用时
     // 会因 HMR 事务嵌套而失败（"HMR transactions cannot be nested"），
     // 所以这里单独持久化一份「桥偏好模型」，在新建会话时套用到会话上。
@@ -438,11 +456,18 @@ export class DshAdapter {
         if (!!a.running !== !!b.running) return a.running ? -1 : 1;
         return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
       });
-      return filtered.map((item) => ({
-        ...item,
-        archived: this.archivedIds.has(item.sessionId),
-        pinned: this.pinnedIds.has(item.sessionId),
-      }));
+      // v3.5：缓存缺失的会话排在最前的（≤20 个）进后台补齐队列，不阻塞本次响应。
+      this.schedulePreviewBackfill(filtered);
+      return filtered.map((item) => {
+        const entry = this.previewCache.get(item.sessionId);
+        return {
+          ...item,
+          preview: entry !== undefined ? entry.text : '',
+          lastRole: entry !== undefined ? entry.role : '',
+          archived: this.archivedIds.has(item.sessionId),
+          pinned: this.pinnedIds.has(item.sessionId),
+        };
+      });
     } catch (error) {
       throw asBridgeError(error);
     }
@@ -470,6 +495,122 @@ export class DshAdapter {
       this.log(`readTitleSnapshots 失败: ${error instanceof Error ? error.message : String(error)}`);
     }
     return map;
+  }
+
+  // ── v3.5：会话列表「最后一条消息预览」缓存 ─────────────────────────────
+
+  /**
+   * 实时更新入口（index.js 把 EventHub 的事件订阅喂进来）。
+   * 只认 message.created（user 气泡入库）与 message.done（assistant 完成）；
+   * tool 走 message.part，不进预览（lastRole 契约只有 user|assistant）。
+   * @param {{ type: string, sessionId?: string, dshSeq?: number, payload?: object }} envelope
+   */
+  observePreviewEvent(envelope) {
+    if (envelope === null || typeof envelope !== 'object') return;
+    if (envelope.type !== 'message.created' && envelope.type !== 'message.done') return;
+    const sessionId = typeof envelope.sessionId === 'string' ? envelope.sessionId : '';
+    if (sessionId.length === 0) return;
+    const payload = envelope.payload !== null && typeof envelope.payload === 'object' ? envelope.payload : {};
+    const role = payload.role === 'assistant' ? 'assistant' : 'user';
+    const text = previewOfBlocks(payload.blocks);
+    // dshSeq 是 DSH 侧 per-session 事件 seq，与 getHistoryPage 回的 message.seq
+    // 同一序号空间，用它挡住乱序/回放事件覆盖较新的缓存。
+    const seq = typeof envelope.dshSeq === 'number' && envelope.dshSeq > 0 ? envelope.dshSeq : undefined;
+    this.setPreview(sessionId, text, role, seq);
+  }
+
+  /** 写缓存（seq 单调保护 + 容量上限）。 */
+  setPreview(sessionId, text, role, seq) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+    const current = this.previewCache.get(sessionId);
+    if (current !== undefined && typeof current.seq === 'number'
+      && typeof seq === 'number' && seq <= current.seq) {
+      return;
+    }
+    if (current === undefined && this.previewCache.size >= PREVIEW_CACHE_LIMIT) {
+      const oldest = this.previewCache.keys().next();
+      if (oldest.done !== true) this.previewCache.delete(oldest.value);
+    }
+    this.previewCache.set(sessionId, { text, role, seq });
+  }
+
+  /**
+   * 把排好序的会话列表里缓存缺失的前 PREVIEW_BACKFILL_LIMIT 个排进补齐队列
+   * （fire-and-forget，不阻塞调用方）。空会话（blank）没有用户气泡，跳过省一次日志读取。
+   */
+  schedulePreviewBackfill(items, limit = PREVIEW_BACKFILL_LIMIT) {
+    const candidates = Array.isArray(items) ? items.slice(0, limit) : [];
+    let queued = false;
+    for (const item of candidates) {
+      const sessionId = item !== null && typeof item === 'object' ? item.sessionId : undefined;
+      if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+      if (item.blank === true) continue;
+      if (this.previewCache.has(sessionId)) continue;
+      if (this._previewQueued.has(sessionId) || this._previewInFlight.has(sessionId)) continue;
+      this._previewQueued.add(sessionId);
+      this._previewQueue.push(sessionId);
+      queued = true;
+    }
+    if (queued) this.drainPreviewQueue();
+  }
+
+  /**
+   * 顺序消费补齐队列（单飞：并发调用共用同一个在跑的 promise）。
+   * 每项复用 getHistoryPage({turns:1}) 取最新 turn，取最后一条 user/assistant 消息
+   * 生成预览；读不到（已删/无 turn）就落一个空串占位，避免同一会话反复重读。
+   */
+  drainPreviewQueue() {
+    if (this._previewDrainPromise !== null) return this._previewDrainPromise;
+    this._previewDrainPromise = (async () => {
+      try {
+        for (;;) {
+          const sessionId = this._previewQueue.shift();
+          if (sessionId === undefined) break;
+          this._previewQueued.delete(sessionId);
+          this._previewInFlight.add(sessionId);
+          try {
+            const page = await this.getHistoryPage(sessionId, { turns: 1 });
+            const last = lastChatMessage(page.messages);
+            if (last !== undefined) {
+              this.setPreview(
+                sessionId,
+                previewOfBlocks(last.blocks),
+                last.role === 'assistant' ? 'assistant' : 'user',
+                typeof last.seq === 'number' && last.seq > 0 ? last.seq : undefined,
+              );
+            } else {
+              this.setPreview(sessionId, '', '', 0);
+            }
+          } catch (error) {
+            // 读不到（已删/瞬时错误）也落空串占位，避免每次列表都重读同一个坏会话；
+            // 后续真实消息事件（seq > 0）仍会正常覆盖。
+            this.setPreview(sessionId, '', '', 0);
+            this.log(`预览补齐失败(${sessionId}): ${error instanceof Error ? error.message : String(error)}`);
+          } finally {
+            this._previewInFlight.delete(sessionId);
+          }
+        }
+      } finally {
+        this._previewDrainPromise = null;
+      }
+    })();
+    return this._previewDrainPromise;
+  }
+
+  /**
+   * 启动预热：拉一次列表，对前 PREVIEW_BACKFILL_LIMIT 个缺失会话补齐预览
+   * （index.js boot 里 fire-and-forget）。只跑一次。
+   */
+  async warmPreviewCache() {
+    if (this._previewWarmed) return;
+    this._previewWarmed = true;
+    try {
+      const sessions = await this.listSessions(false);
+      this.schedulePreviewBackfill(sessions);
+      await this.drainPreviewQueue();
+    } catch (error) {
+      this.log(`预览预热失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   // ── 单个会话 ───────────────────────────────────────────────────────────

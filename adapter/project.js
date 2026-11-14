@@ -202,6 +202,58 @@ export function textOfBlocks(blocks) {
   return parts.join('\n');
 }
 
+// ── v3.5：会话列表「最后一条消息预览」（contract.md §3.1 preview/lastRole）──
+
+/**
+ * 单行化 + 截断：连续空白折叠成一个空格，首尾去空白；
+ * 超过 limit（按 Unicode 码点数，中文不虚增）时截断并补省略号，总长 ≤ limit。
+ */
+export function toPreviewText(text, limit = 60) {
+  const max = Number.isInteger(limit) && limit > 0 ? limit : 60;
+  const single = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (single.length === 0) return '';
+  const characters = Array.from(single);
+  if (characters.length <= max) return single;
+  return `${characters.slice(0, max - 1).join('')}…`;
+}
+
+/**
+ * 从手机线内容块生成预览文本：
+ *   text 拼接；image/video/file/toolCall 块 → 占位符；reasoning 不进预览。
+ * 没有任何可读内容时返回空串。
+ */
+export function previewOfBlocks(blocks, limit = 60) {
+  const parts = [];
+  for (const block of Array.isArray(blocks) ? blocks : []) {
+    if (block === null || typeof block !== 'object') continue;
+    if (block.type === 'text' || block.type === 'reasoning') {
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+        parts.push(block.text.trim());
+      }
+      continue;
+    }
+    if (block.type === 'image') parts.push('[图片]');
+    else if (block.type === 'video') parts.push('[视频]');
+    else if (block.type === 'file') parts.push('[文件]');
+    else if (block.type === 'toolCall') parts.push('[工具调用]');
+  }
+  return toPreviewText(parts.join(' '), limit);
+}
+
+/**
+ * 取消息数组里最后一条 user/assistant 气泡（tool/system/developer 不算，
+ * lastRole 契约只有 'user'|'assistant'）。没有返回 undefined。
+ */
+export function lastChatMessage(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index];
+    if (message === null || typeof message !== 'object') continue;
+    if (message.role === 'user' || message.role === 'assistant') return message;
+  }
+  return undefined;
+}
+
 /**
  * 手机端带宽裁剪。
  * 真实会话里单条工具结果是几十 KB 级（实测一页 2 个 turn 就有 464KB），

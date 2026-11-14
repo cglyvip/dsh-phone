@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { WebSocket } from 'ws';
 
 import { apply, normalize } from './index.js';
-import { projectEvents } from './adapter/project.js';
+import { lastChatMessage, previewOfBlocks, projectEvents, toPreviewText } from './adapter/project.js';
 import { buildFrpcConfig, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
 import { ensureNgrokBinary, extractNgrokFromZip, ngrokReleaseInfo, parseNgrokLine, verifyNgrokAsset } from './bridge/ngrok.js';
 import { probePublicUrl } from './bridge/transport.js';
@@ -132,6 +132,7 @@ async function waitForCondition(getValue, expect, timeoutMs = 8000, label = '条
 
 const SESSION_A = 'session-aaaa';
 const SESSION_B = 'session-bbbb';
+const SESSION_C = 'session-cccc';
 
 const fakeEvents = [
   { type: 'permission/preset', seq: 0, time: 1000, data: { preset: 'workspace-write' } },
@@ -179,6 +180,7 @@ function makeFakeCtx() {
           items: [
             { sessionId: SESSION_A, updatedAt: 1014, running: false, blank: false, cwd: 'E:\\work', agentAvailable: true },
             { sessionId: SESSION_B, updatedAt: 900, running: false, blank: true, cwd: 'E:\\work', agentAvailable: true },
+            { sessionId: SESSION_C, updatedAt: 800, running: false, blank: true, cwd: 'E:\\work', agentAvailable: true },
           ],
         };
       },
@@ -496,7 +498,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.4.0');
+  assert.equal(health.json.bridgeVersion, '3.5.0');
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -528,11 +530,29 @@ async function main() {
   // 6) 会话列表（含标题）
   const sessions = await request(port, 'GET', '/api/sessions', { token });
   assert.equal(sessions.status, 200);
-  assert.equal(sessions.json.items.length, 2);
+  assert.equal(sessions.json.items.length, 3);
   const sessionA = sessions.json.items.find((item) => item.sessionId === SESSION_A);
   assert.ok(sessionA !== undefined);
   assert.equal(sessionA.title, '打招呼');
   pass('GET /api/sessions（标题已补全）');
+
+  // 6b) v3.5 §3.1：preview / lastRole（启动批量补齐后台跑，轮询等它落库）
+  let previewA = null;
+  let previewC = null;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const list = await request(port, 'GET', '/api/sessions', { token });
+    previewA = list.json.items.find((item) => item.sessionId === SESSION_A) ?? null;
+    previewC = list.json.items.find((item) => item.sessionId === SESSION_C) ?? null;
+    if (previewA !== null && previewA.preview.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(previewA !== null, '会话列表应包含会话 A');
+  assert.equal(previewA.preview, '你好，有什么可以帮你的？', '预览应是最后一条 assistant 消息');
+  assert.equal(previewA.lastRole, 'assistant');
+  assert.ok(previewC !== null, '会话列表应包含会话 C');
+  assert.equal(previewC.preview, '', '空会话预览应为空串');
+  assert.equal(previewC.lastRole, '', '空会话 lastRole 应为空串');
+  pass('GET /api/sessions preview（启动批量补齐 + 空会话空串）');
 
   // 7) 单个会话
   const one = await request(port, 'GET', `/api/sessions/${SESSION_A}`, { token });
@@ -607,7 +627,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.4.0');
+  assert.equal(hello.payload.bridgeVersion, '3.5.0');
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -645,6 +665,25 @@ async function main() {
   });
   assert.equal(await otherSession, null, '不应推送未订阅会话的事件');
   pass('WS 会话过滤');
+
+  // 16b) v3.5 §3.1：message.created 事件实时更新预览
+  //（假 ctx 没有 workspaceController.follow，归档集合为空 → B 仍在主列表里）
+  let liveA = null;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const list = await request(port, 'GET', '/api/sessions', { token });
+    liveA = list.json.items.find((item) => item.sessionId === SESSION_A) ?? null;
+    if (liveA !== null && liveA.preview === '实时推送' && liveA.lastRole === 'user') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(liveA !== null, '主列表应包含会话 A');
+  assert.equal(liveA.preview, '实时推送', '预览应随 message.created 实时更新');
+  assert.equal(liveA.lastRole, 'user');
+  const liveList = await request(port, 'GET', '/api/sessions', { token });
+  const liveB = liveList.json.items.find((item) => item.sessionId === SESSION_B);
+  assert.ok(liveB !== undefined, '会话列表应包含会话 B');
+  assert.equal(liveB.preview, '别的会话', '未订阅/未预热会话的预览也应被事件更新');
+  assert.equal(liveB.lastRole, 'user');
+  pass('会话预览随 message.created 实时更新');
 
   // 助手流式增量
   const streamFrame = waitFor(ws, (frame) => frame.type === 'assistant.stream');
@@ -1736,6 +1775,40 @@ async function main() {
   assert.equal(offStatus.json.tunnelMode, 'off');
   pass('HTTP 切换带参数持久化（authtoken 只落盘不回显 / custom 降级 / 非法值拒绝）');
 
+  // 34) v3.5 §3.1：预览纯函数（60 字截断 / 占位符 / 单行化 / lastChatMessage）
+  {
+    const cut = toPreviewText('很'.repeat(100));
+    assert.equal(Array.from(cut).length, 60, '超长预览应按码点截到 60 字');
+    assert.ok(cut.endsWith('…'), '截断预览应以省略号结尾');
+    assert.equal(
+      toPreviewText('第一行\n第二行\t制表符   多空格'),
+      '第一行 第二行 制表符 多空格',
+      '预览应单行化（连续空白折叠成空格）',
+    );
+    assert.equal(toPreviewText('   \n\t '), '', '纯空白预览应为空串');
+    assert.equal(
+      previewOfBlocks([
+        { type: 'text', text: '看这张图和视频' },
+        { type: 'image', attachmentId: 'sha256:aa' },
+        { type: 'video', attachmentId: 'media:v.mp4' },
+        { type: 'file', attachmentId: 'sha256:bb', name: 'x.pdf' },
+        { type: 'toolCall', id: 't1', name: 'read_file', arguments: '{}' },
+        { type: 'reasoning', text: '思考过程不应进预览' },
+      ]),
+      '看这张图和视频 [图片] [视频] [文件] [工具调用]',
+      '占位符规则：image/video/file/toolCall 块各得一个占位，reasoning 不进预览',
+    );
+    assert.equal(previewOfBlocks([{ type: 'image', attachmentId: 'x' }]), '[图片]', '纯图片消息 → 占位符');
+    assert.equal(previewOfBlocks([]), '', '无块 → 空串');
+    const last = lastChatMessage([
+      { role: 'tool', text: '工具结果' },
+      { seq: 12, role: 'assistant', text: '最终回答' },
+      { seq: 13, role: 'system', text: '系统消息' },
+    ]);
+    assert.ok(last !== undefined && last.seq === 12, 'lastChatMessage 应跳过 tool/system 取最后一条 assistant');
+    assert.equal(lastChatMessage([{ role: 'tool' }]), undefined, '只有 tool 消息 → undefined');
+  }
+  pass('预览纯函数（60 字截断 / 占位符 / 单行化 / lastChatMessage）');
 
   console.log(`\n✅ 冒烟测试全部通过（${passed} 项）`);
   cleanup();

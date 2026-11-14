@@ -5,7 +5,7 @@
  */
 
 /** 插件（桥）自身语义化版本。 */
-export const BRIDGE_VERSION = '3.4.0';
+export const BRIDGE_VERSION = '3.5.0';
 
 /** 协议契约版本。手机端必须在 hello 中回传 contractVersion。 */
 export const CONTRACT_VERSION = 3;
