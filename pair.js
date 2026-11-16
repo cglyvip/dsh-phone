@@ -94,6 +94,8 @@ export function pairHtml(info) {
   const publicUrl = typeof info.publicUrl === 'string' ? info.publicUrl : '';
   const tunnelUrl = typeof info.tunnelUrl === 'string' ? info.tunnelUrl : '';
   const channels = info.channels !== null && typeof info.channels === 'object' ? info.channels : {};
+  // frp 通道参数（回显 serverAddr/serverPort/remotePort 便于换机修改；token 只回「是否已保存」）
+  const frpConfig = info.frp !== null && typeof info.frp === 'object' ? info.frp : {};
   const currentChannel = typeof info.currentChannel === 'string' ? info.currentChannel : 'off';
   const transportApiPath = typeof info.transportApiPath === 'string' ? info.transportApiPath : '/api/transport/mode';
   const code = typeof info.code === 'string' ? info.code : '';
@@ -148,9 +150,26 @@ export function pairHtml(info) {
           <div class="pv-fields">${escapeHtml(provider.fields)}</div>
           <div class="pv-notes">${escapeHtml(provider.notes)}</div>
         </div>`).join('\n');
+      // frp 参数表单：换电脑时只改这一处即可，token 只落 transport.json（600）不回显
+      const frpCfg = frpConfig !== null && typeof frpConfig === 'object' ? frpConfig : {};
+      const frpAddr = typeof frpCfg.serverAddr === 'string' ? frpCfg.serverAddr : '';
+      const frpPort = Number.isInteger(frpCfg.serverPort) ? frpCfg.serverPort : 7000;
+      const frpRemote = Number.isInteger(frpCfg.remotePort) ? frpCfg.remotePort : 0;
+      const frpHasToken = frpCfg.hasToken === true;
       extra = `
+      <div class="ch-form">
+        <input id="frp-server-addr" class="ch-input" type="text" placeholder="serverAddr：VPS 地址或域名，如 1.2.3.4" autocomplete="off" value="${escapeHtml(frpAddr)}">
+        <div class="ch-form-row">
+          <input id="frp-server-port" class="ch-input" type="number" inputmode="numeric" placeholder="serverPort（默认 7000）" autocomplete="off" value="${frpPort}">
+          <input id="frp-remote-port" class="ch-input" type="number" inputmode="numeric" placeholder="remotePort（0=由 frps 分配）" autocomplete="off" value="${frpRemote}">
+        </div>
+        <input id="frp-token" class="ch-input" type="password" placeholder="${frpHasToken ? 'token 已保存，留空则不修改' : 'token：frps 的 auth.token（必填）'}" autocomplete="off">
+        <label class="ch-check"><input id="frp-use-tls" type="checkbox"${frpCfg.useTls === true ? ' checked' : ''}> 启用 TLS（frps 开了 transport.tls 才勾）</label>
+        <button class="ch-btn" data-mode="frp" data-frp="1">保存并切换</button>
+        <div class="ch-desc">切换后桥自动下载托管 frpc.exe；token 只落 transport.json（600），不回显。remotePort 填 0 时由 frps 随机分配。</div>
+      </div>
       <details class="ch-extra">
-        <summary>服务商预设（全是 frp 协议，字段同模板）</summary>
+        <summary>服务商预设（全是 frp 协议，字段同上面的表单）</summary>
         ${providerRows}
       </details>`;
     }
@@ -174,7 +193,8 @@ export function pairHtml(info) {
         <div class="ch-desc">切换后桥自动下载托管 ngrok.exe（用户手放 ~/.dsh/phone-bridge/ngrok/ 优先）；authtoken 只落 transport.json，不回显。</div>
       </div>`;
     }
-    const switchButton = (id === 'custom' || id === 'ngrok')
+    // 带表单的卡片（frp/custom/ngrok）按钮由表单自己渲染，避免出现两个切换按钮
+    const switchButton = (id === 'frp' || id === 'custom' || id === 'ngrok')
       ? ''
       : `${active ? '' : `<button class="ch-btn" data-mode="${id}"${channel.status === 'reserved' ? ' disabled' : ''}>切换到此通道</button>`}`;
     return `
@@ -278,6 +298,7 @@ export function pairHtml(info) {
   .ch-input:focus { outline: none; border-color: var(--brand); }
   .ch-form-row { display: flex; gap: 8px; }
   .ch-form-row .ch-btn { flex: 1; }
+  .ch-check { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-2); cursor: pointer; }
   .probe-badge { display: inline-block; margin-top: 6px; font-size: 12px; min-height: 16px; word-break: break-all; }
   .probe-ok { color: #15803D; font-weight: 600; }
   .probe-fail { color: #B91C1C; }
@@ -347,6 +368,23 @@ export function pairHtml(info) {
       if (urlInputId) {
         const input = document.getElementById(urlInputId);
         payload.publicUrl = input ? input.value.trim() : '';
+      }
+      if (btn.getAttribute('data-frp') === '1') {
+        const addrInput = document.getElementById('frp-server-addr');
+        const portInput = document.getElementById('frp-server-port');
+        const remoteInput = document.getElementById('frp-remote-port');
+        const tokenInput = document.getElementById('frp-token');
+        const tlsInput = document.getElementById('frp-use-tls');
+        const frpParams = {};
+        if (addrInput) frpParams.serverAddr = addrInput.value.trim();
+        const portNum = portInput ? parseInt(portInput.value, 10) : NaN;
+        if (Number.isFinite(portNum) && portNum > 0) frpParams.serverPort = portNum;
+        const remoteNum = remoteInput ? parseInt(remoteInput.value, 10) : NaN;
+        if (Number.isFinite(remoteNum) && remoteNum >= 0) frpParams.remotePort = remoteNum;
+        // 留空 = 沿用已保存的 token（页面不回显，避免密钥落在浏览器历史里）
+        if (tokenInput && tokenInput.value.trim().length > 0) frpParams.token = tokenInput.value.trim();
+        frpParams.useTls = tlsInput !== null && tlsInput.checked === true;
+        payload.frp = frpParams;
       }
       if (btn.getAttribute('data-ngrok') === '1') {
         const authtokenInput = document.getElementById('ngrok-authtoken');

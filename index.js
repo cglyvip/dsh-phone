@@ -180,8 +180,15 @@ export function apply(ctx, config) {
     try {
       if (fs.existsSync(transportOverrideFile)) {
         const parsed = JSON.parse(fs.readFileSync(transportOverrideFile, 'utf8'));
-        if (parsed !== null && typeof parsed === 'object' && TUNNEL_MODES.includes(parsed.tunnelMode)) {
-          transportOverrides = { tunnelMode: parsed.tunnelMode };
+        if (parsed !== null && typeof parsed === 'object') {
+          // 整份覆盖：配对页填的 frp / ngrok 参数与 publicUrl 也要读回，
+          // 否则「切通道 → 重启 DSH」会丢掉刚填的地址和 token。
+          const overrides = {};
+          if (TUNNEL_MODES.includes(parsed.tunnelMode)) overrides.tunnelMode = parsed.tunnelMode;
+          if (typeof parsed.publicUrl === 'string') overrides.publicUrl = parsed.publicUrl;
+          if (parsed.frp !== null && typeof parsed.frp === 'object') overrides.frp = parsed.frp;
+          if (parsed.ngrok !== null && typeof parsed.ngrok === 'object') overrides.ngrok = parsed.ngrok;
+          transportOverrides = overrides;
         }
       }
     } catch (error) {
@@ -190,9 +197,11 @@ export function apply(ctx, config) {
     const transport = new TransportManager({
       config: normalizeTransportConfig({
         tunnelMode: transportOverrides.tunnelMode ?? cfg.tunnelMode,
-        publicUrl: cfg.publicUrl,
+        publicUrl: transportOverrides.publicUrl ?? cfg.publicUrl,
         cloudflaredPath: cfg.cloudflaredPath,
-        frp: cfg.frp,
+        // 浅合并：transport.json 里有的字段优先，缺的字段沿用插件 config
+        frp: { ...(cfg.frp ?? {}), ...(transportOverrides.frp ?? {}) },
+        ngrok: { ...(cfg.ngrok ?? {}), ...(transportOverrides.ngrok ?? {}) },
         relay: cfg.relay,
       }),
       home: defaultTokenHome(),
@@ -280,6 +289,7 @@ export function apply(ctx, config) {
             publicUrl: cfg.publicUrl,
             tunnelUrl: transportStatus.tunnelUrl,
             channels: transportStatus.channels,
+            frp: transport.frpFormValues(),
             currentChannel: transportStatus.tunnelMode,
             transportApiPath: '/api/transport/mode',
             port: state.port,

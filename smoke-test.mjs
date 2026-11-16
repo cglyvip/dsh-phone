@@ -22,6 +22,7 @@ import { lastChatMessage, previewOfBlocks, projectEvents, toPreviewText } from '
 import { buildFrpcConfig, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
 import { ensureNgrokBinary, extractNgrokFromZip, ngrokReleaseInfo, parseNgrokLine, verifyNgrokAsset } from './bridge/ngrok.js';
 import { probePublicUrl } from './bridge/transport.js';
+import { BRIDGE_VERSION } from './shared/version.js';
 import { FRP_PROVIDERS, pairHtml } from './pair.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
 
@@ -498,7 +499,7 @@ async function main() {
   assert.equal(health.status, 200);
   assert.equal(health.json.status, 'ok');
   assert.equal(health.json.plugin, 'dsh-phone-bridge');
-  assert.equal(health.json.bridgeVersion, '3.5.0');
+  assert.equal(health.json.bridgeVersion, BRIDGE_VERSION);
   assert.equal(health.json.contractVersion, 3);
   pass('GET /api/health');
 
@@ -627,7 +628,7 @@ async function main() {
   // 16) WS：hello + subscribe + 事件推送 + send + stop
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`);
   const hello = await waitFor(ws, (frame) => frame.type === 'hello');
-  assert.equal(hello.payload.bridgeVersion, '3.5.0');
+  assert.equal(hello.payload.bridgeVersion, BRIDGE_VERSION);
   assert.equal(hello.payload.contractVersion, 3);
   pass('WS hello');
 
@@ -1734,10 +1735,28 @@ async function main() {
   });
   assert.ok(providerRender.includes('服务商预设'), 'frp 卡片应渲染预设折叠区');
   assert.ok(providerRender.includes('OpenFrp'), '预设区应列出 OpenFrp');
+  assert.ok(providerRender.includes('frp-server-addr'), 'frp 卡片应有 serverAddr 输入框');
+  assert.ok(providerRender.includes('frp-server-port'), 'frp 卡片应有 serverPort 输入框');
+  assert.ok(providerRender.includes('frp-remote-port'), 'frp 卡片应有 remotePort 输入框');
+  assert.ok(providerRender.includes('frp-token'), 'frp 卡片应有 token 输入框');
+  assert.ok(providerRender.includes('data-frp="1"'), 'frp 卡片应有带参数的保存按钮');
   assert.ok(providerRender.includes('custom-url'), 'custom 卡片应有地址输入框');
   assert.ok(providerRender.includes('/api/transport/probe'), 'custom 卡片应有探活按钮');
   assert.ok(providerRender.includes('ngrok-authtoken'), 'ngrok 卡片应有 authtoken 输入框');
-  pass('frp 服务商预设模板 + 配对页卡片渲染（custom/ngrok 表单齐全）');
+  // 回显：地址与端口来自 frpFormValues()，token 只回「是否已保存」
+  const frpEchoRender = pairHtml({
+    lanUrl: 'ws://192.168.1.5:8787',
+    channels: { frp: { label: 'frp', desc: '', status: 'running', url: 'http://1.2.3.4:27000', error: '' } },
+    frp: { serverAddr: '1.2.3.4', serverPort: 7000, remotePort: 27000, useTls: true, hasToken: true },
+    currentChannel: 'frp',
+    port: 8787, clients: 0, code: '123456', expiresAt: Date.now() + 60000,
+    bridgeVersion: BRIDGE_VERSION, contractVersion: 3,
+  });
+  assert.ok(frpEchoRender.includes('value="1.2.3.4"'), 'frp 表单应回显已保存的 serverAddr');
+  assert.ok(frpEchoRender.includes('value="27000"'), 'frp 表单应回显已保存的 remotePort');
+  assert.ok(frpEchoRender.includes('token 已保存，留空则不修改'), '已有 token 时只提示，不回显密钥');
+  assert.ok(!frpEchoRender.includes('vps-secret-token'), '配对页绝不回显 frp token');
+  pass('frp 服务商预设模板 + 配对页卡片渲染（frp/custom/ngrok 表单齐全 + 参数回显不含密钥）');
 
   // 33) v3.3 §10.1：HTTP 切换带参数持久化（token/authtoken 只落盘不回显）
   mkdirSync(join(tmpDir, 'phone-bridge', 'ngrok'), { recursive: true });
@@ -1768,12 +1787,39 @@ async function main() {
   });
   assert.equal(emptyCustomSwitch.status, 200);
   assert.equal(emptyCustomSwitch.json.channels.custom.status, 'error', 'custom 缺地址 → 降级并在卡片显示错误');
+  // frp 带参数切换（配对页表单）：参数落盘、token 不回显、留空 token 保持原值
+  mkdirSync(join(tmpDir, 'phone-bridge', 'frpc'), { recursive: true });
+  writeFileSync(join(tmpDir, 'phone-bridge', 'frpc', 'frpc.exe'), 'USER-FRPC');
+  const frpSwitch = await request(port, 'POST', '/api/transport/mode', {
+    token,
+    body: {
+      tunnelMode: 'frp',
+      frp: { serverAddr: '198.51.100.7', serverPort: 7001, token: 'frp-http-token-33', remotePort: 27001 },
+    },
+  });
+  assert.equal(frpSwitch.status, 200);
+  assert.equal(frpSwitch.json.tunnelMode, 'frp');
+  assert.ok(!JSON.stringify(frpSwitch.json).includes('frp-http-token-33'), 'frp token 不回显');
+  const persistedFrp = JSON.parse(readFileSync(join(tmpDir, 'transport.json'), 'utf8'));
+  assert.equal(persistedFrp.frp.serverAddr, '198.51.100.7');
+  assert.equal(persistedFrp.frp.serverPort, 7001);
+  assert.equal(persistedFrp.frp.remotePort, 27001);
+  assert.equal(persistedFrp.frp.token, 'frp-http-token-33', 'frp token 只落 transport.json（600）');
+  // 表单留空 token（页面不回显）→ 沿用已保存的 token，不清空
+  const frpSwitchNoToken = await request(port, 'POST', '/api/transport/mode', {
+    token,
+    body: { tunnelMode: 'frp', frp: { serverAddr: '198.51.100.7', serverPort: 7001, token: '', remotePort: 27002 } },
+  });
+  assert.equal(frpSwitchNoToken.status, 200);
+  const persistedFrp2 = JSON.parse(readFileSync(join(tmpDir, 'transport.json'), 'utf8'));
+  assert.equal(persistedFrp2.frp.token, 'frp-http-token-33', '留空 token 应保留原值而不是清空');
+  assert.equal(persistedFrp2.frp.remotePort, 27002, '其它字段仍按表单更新');
   const hackerMode = await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'hacker' } });
   assert.equal(hackerMode.status, 400);
   await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'off' } });
   const offStatus = await request(port, 'GET', '/api/transport', { token });
   assert.equal(offStatus.json.tunnelMode, 'off');
-  pass('HTTP 切换带参数持久化（authtoken 只落盘不回显 / custom 降级 / 非法值拒绝）');
+  pass('HTTP 切换带参数持久化（authtoken/token 只落盘不回显 / 留空保留密钥 / custom 降级 / 非法值拒绝）');
 
   // 34) v3.5 §3.1：预览纯函数（60 字截断 / 占位符 / 单行化 / lastChatMessage）
   {

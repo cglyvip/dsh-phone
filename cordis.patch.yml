@@ -20,6 +20,27 @@
         allowOrigins: []
         # 公网地址：填了就以它为准（例如 https://xxx.trycloudflare.com）
         publicUrl: ''
+        # 公网通道：off（仅局域网）/ quick / named / frp / custom / ngrok / relay
+        # 不写这行时按旧配置 cloudflareTunnel 推断；推荐换电脑后不改这里，
+        # 直接打开 http://127.0.0.1:9000/pair 在页面上填并切换，
+        # 参数会写进 $DSH_HOME/phone-bridge/transport.json（优先级高于本文件）。
+        # tunnelMode: off
+        # frp 通道参数（tunnelMode: frp 时生效；也可以在配对页表单里填）
+        frp:
+          # VPS 地址或域名
+          serverAddr: ''
+          # frps bindPort，默认 7000
+          serverPort: 7000
+          # frps 的 auth.token —— 公网暴露必须鉴权，留空会拒绝启动 frp 通道
+          token: ''
+          # 映射到公网的端口；填 0 表示由 frps 随机分配
+          remotePort: 0
+          # frps 开了 transport.tls 才置 true
+          useTls: false
+        # ngrok 通道参数（tunnelMode: ngrok 时生效；同样可在配对页填）
+        ngrok:
+          authtoken: ''
+          staticDomain: ''
         # Cloudflare 快速隧道：off / pair（执行 /pair 时启动）/ startup（启动即开）
         cloudflareTunnel: off
         cloudflaredPath: cloudflared

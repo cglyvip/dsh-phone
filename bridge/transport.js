@@ -62,6 +62,22 @@ export function normalizeTransportConfig(config) {
   };
 }
 
+/**
+ * 合并密钥字段：配对页不回显 token / authtoken，表单留空表示「保持原值」。
+ * 其它字段（地址、端口等）以表单为准，允许用户改小或清空。
+ */
+function mergeSecretFields(previous, incoming) {
+  const prev = previous !== null && typeof previous === 'object' ? previous : {};
+  const next = { ...incoming };
+  if (typeof next.token !== 'string' || next.token.length === 0) {
+    if (typeof prev.token === 'string' && prev.token.length > 0) next.token = prev.token;
+  }
+  if (typeof next.authtoken !== 'string' || next.authtoken.length === 0) {
+    if (typeof prev.authtoken === 'string' && prev.authtoken.length > 0) next.authtoken = prev.authtoken;
+  }
+  return next;
+}
+
 /** 通道卡片静态文案（选型建议按 contract §10 / §10.1）。 */
 export const CHANNEL_LABELS = {
   quick: { label: 'Cloudflare 快速隧道', desc: '免费试用，地址重启会变' },
@@ -466,11 +482,12 @@ export class TransportManager {
     const params = options.params !== null && typeof options.params === 'object' ? options.params : null;
     if (params !== null) {
       if (typeof params.publicUrl === 'string') this.cfg.publicUrl = params.publicUrl.trim();
+      // 表单留空的字段沿用已保存的值：token / authtoken 页面不回显，留空即「不修改」
       if (params.frp !== null && typeof params.frp === 'object') {
-        this.cfg.frp = normalizeTransportConfig({ frp: params.frp }).frp;
+        this.cfg.frp = normalizeTransportConfig({ frp: mergeSecretFields(this.cfg.frp, params.frp) }).frp;
       }
       if (params.ngrok !== null && typeof params.ngrok === 'object') {
-        this.cfg.ngrok = normalizeTransportConfig({ ngrok: params.ngrok }).ngrok;
+        this.cfg.ngrok = normalizeTransportConfig({ ngrok: mergeSecretFields(this.cfg.ngrok, params.ngrok) }).ngrok;
       }
     }
     this.log(`切换公网通道：${this.cfg.tunnelMode} → ${mode}`);
@@ -537,6 +554,20 @@ export class TransportManager {
       tunnelUrl,
       tunnelError,
       channels,
+    };
+  }
+
+  /**
+   * 配对页 frp 表单回显值（仅本机页面使用）。
+   * 绝不返回 token 本身，只回 hasToken 让页面提示「已保存，留空不修改」。
+   */
+  frpFormValues() {
+    return {
+      serverAddr: this.cfg.frp.serverAddr,
+      serverPort: this.cfg.frp.serverPort,
+      remotePort: this.cfg.frp.remotePort,
+      useTls: this.cfg.frp.useTls,
+      hasToken: this.cfg.frp.token.length > 0,
     };
   }
 

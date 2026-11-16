@@ -1,5 +1,43 @@
 ﻿# CHANGELOG
 
+## 3.5.1（2026-11-17）
+
+### 修复（换电脑后无法填 frp 参数）
+
+- **配对页 frp 卡片补表单**：原来只有「服务商预设」文字说明，没有任何输入框，
+  导致新机器上只能手改 `cordis.patch.yml`。现在与 custom / ngrok 卡片一致：
+  - `serverAddr`（VPS 地址或域名）
+  - `serverPort`（frps bindPort，默认 7000）
+  - `remotePort`（公网映射端口，0 = 由 frps 随机分配）
+  - `token`（frps auth.token，密码框，页面不回显）
+  - `useTls` 勾选框（frps 开了 `transport.tls` 才勾）
+  - 「保存并切换」按钮带 `data-frp="1"`，前端收集后 POST `/api/transport/mode`
+- **表单回显但不泄密**：`serverAddr/serverPort/remotePort/useTls` 从
+  `TransportManager.frpFormValues()` 回显；token 只回 `hasToken` 布尔，
+  页面显示「token 已保存，留空则不修改」，密钥永不出现在 HTML 里
+- **留空即保留密钥**：`switchMode` 新增 `mergeSecretFields`，表单里 token /
+  authtoken 留空时沿用已保存值（此前会把 token 清空导致 frp 通道拒绝启动）
+- **重启不再丢参数**：`index.js` 启动时从 `transport.json` 读回的字段从
+  只有 `tunnelMode` 扩展为 `tunnelMode + publicUrl + frp + ngrok`
+  （与插件 config 浅合并，transport.json 优先）。此前在配对页填完 frp 参数
+  并切换，重启 DSH 后会回落到 `cordis.patch.yml` 的旧值
+- **随包默认配置补 frp / ngrok 段**：`cordis.patch.yml` 新增 `tunnelMode`、
+  `frp`（5 个字段）、`ngrok`（2 个字段）的注释模板，新机器装上插件即可看到
+  可填位置；不写 `tunnelMode` 时仍按旧 `cloudflareTunnel` 推断
+
+### 测试
+
+- 冒烟测试新增断言：frp 表单四个输入框 + `data-frp` 按钮存在、
+  参数回显不含 token、「留空 token 保留原值」端到端校验
+- 前端脚本实测：填 `10.0.0.9 / 7002 / 28000 / newtok / TLS` →
+  请求体 `{"tunnelMode":"frp","frp":{"serverAddr":"10.0.0.9",...}}`；
+  token 留空 → 请求体不带 `token` 字段
+
+### 说明
+
+- `CONTRACT_VERSION` 仍为 3（纯 UI 与配置持久化修复，无协议变更）
+- 升级后需完全退出 DSH（托盘右键退出）再启动，插件才会重新加载
+
 ## 3.5.0（2026-11-15）
 
 ### 新增（contract §3.1：会话列表「最后一条消息预览」）
