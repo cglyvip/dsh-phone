@@ -1,0 +1,15 @@
+# 依赖与构建产物
+node_modules/
+package-lock.json.bak
+
+# 临时产物
+*.log
+outputs/
+.coverage/
+
+# 敏感与机器相关
+transport.json
+tokens.json
+*runtime.json
+local.properties
+.idea/workspace.xml

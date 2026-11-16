@@ -14,6 +14,13 @@ DeepSeek Harness 的手机端桥接插件。跑在 DSH 桌面客户端进程内�
 > **核心红线**：发消息只走 `sessionController.prompt()`，进入 DSH 的 Agent 循环。
 > 插件从不直连模型 API，也不会绕过 harness 的工具/审批机制。
 
+配套的手机端：
+
+| 仓库 | 平台 |
+|---|---|
+| [dsh-harmony](https://github.com/cglyvip/dsh-harmony) | 鸿蒙（ArkTS / ArkUI） |
+| [dsh-android](https://github.com/cglyvip/dsh-android) | 安卓（Kotlin / Compose） |
+
 ---
 
 ## 架构
@@ -39,7 +46,7 @@ qr.cjs                   二维码生成（纯本地）
 shared/version.js        版本常量
 ```
 
-协议契约见 `E:\HuaWei_xiangmu\DSH\shared\contract\contract.md` 与 `types.ts`。
+协议契约见 [`contract/contract.md`](contract/contract.md) 与 [`contract/types.ts`](contract/types.ts)。
 
 ---
 
@@ -48,7 +55,7 @@ shared/version.js        版本常量
 1. 把整个 `dsh-phone-bridge` 目录复制到
    `C:\Users\CGLY\.dsh\profiles\desktop\node_modules\dsh-phone-bridge\`
 2. 确认 profile 的 `package.json` 里：
-   - `dependencies` 含 `"dsh-phone-bridge": "3.0.0"`
+   - `dependencies` 含 `"dsh-phone-bridge": "3.5.1"`
    - `dsh.profile.bundles` 数组含 `"dsh-phone-bridge"`
 3. profile 的 `cordis.patch.yml` **只放按 id 的配置覆盖**（不要再 `insert`，否则会加载两次）
 4. **完全退出 DSH（托盘右键退出）再启动**
@@ -142,7 +149,7 @@ http://127.0.0.1:9000/pair
 ## 开发与自测
 
 ```powershell
-cd E:\HuaWei_xiangmu\DSH\DSH-CHAJIAN\dsh-phone-bridge
+cd dsh-phone-bridge
 node smoke-test.mjs
 ```
 
