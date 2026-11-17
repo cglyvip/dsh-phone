@@ -16,6 +16,22 @@ import { spawn } from 'node:child_process';
 const URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi;
 const DEFAULT_TIMEOUT_MS = 60000;
 
+export function normalizeCloudflaredProtocol(value) {
+  if (value === undefined) return 'auto';
+  if (typeof value !== 'string' || !['auto', 'http2', 'quic'].includes(value.trim())) {
+    throw new Error('cloudflaredProtocol 必须是 auto / http2 / quic');
+  }
+  return value.trim();
+}
+
+export function normalizeCloudflaredDnsResolvers(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some(resolver => typeof resolver !== 'string')) {
+    throw new Error('cloudflaredDnsResolvers 必须是 DNS address:port 字符串数组');
+  }
+  return value.map(resolver => resolver.trim()).filter(resolver => resolver.length > 0);
+}
+
 /** 隧道流量的 Host 头标记（bridge/http.js 的 isTunnelRequest 用同一常量值）。 */
 export const TUNNEL_HOST_HEADER = 'dsh-phone-bridge-tunnel';
 
@@ -48,19 +64,28 @@ export function startQuickTunnel(options) {
     : DEFAULT_TIMEOUT_MS;
   const log = typeof options.log === 'function' ? options.log : () => {};
   const onExit = typeof options.onExit === 'function' ? options.onExit : () => {};
+  const protocol = normalizeCloudflaredProtocol(options.protocol);
+  const dnsResolvers = normalizeCloudflaredDnsResolvers(options.dnsResolvers);
+  const spawnImpl = typeof options.spawnImpl === 'function' ? options.spawnImpl : spawn;
+  const environment = { ...process.env };
+  if (dnsResolvers.length > 0) {
+    environment.TUNNEL_DNS_RESOLVER_ADDRS = dnsResolvers.join(',');
+  }
 
-  log(`正在启动 Cloudflare 隧道：${command} tunnel --http-host-header ${TUNNEL_HOST_HEADER} --url ${target}`);
+  log(`正在启动 Cloudflare 隧道：${command} tunnel --protocol ${protocol} --http-host-header ${TUNNEL_HOST_HEADER} --url ${target}`);
 
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, [
+      child = spawnImpl(command, [
         'tunnel',
+        '--protocol', protocol,
         '--http-host-header', TUNNEL_HOST_HEADER,
         '--url', target,
       ], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: environment,
       });
     } catch (error) {
       reject(new Error(
@@ -74,7 +99,7 @@ export function startQuickTunnel(options) {
     let output = '';
     let url = '';
     let timer;
-    let readyTimer;
+    let registered = false;
 
     const stop = () => {
       if (child === undefined || child.killed || child.exitCode !== null) return;
@@ -85,7 +110,6 @@ export function startQuickTunnel(options) {
 
     const clearTimers = () => {
       if (timer !== undefined) clearTimeout(timer);
-      if (readyTimer !== undefined) clearTimeout(readyTimer);
     };
 
     const fail = (message) => {
@@ -111,11 +135,10 @@ export function startQuickTunnel(options) {
         const found = output.match(URL_PATTERN);
         if (found !== null && found.length > 0) {
           url = found[0].replace(/\/+$/, '');
-          // cloudflared 打印 URL 时隧道可能还没完全注册；再等 1.5 秒
-          readyTimer = setTimeout(() => finish(url), 1500);
         }
       }
-      if (url.length > 0 && output.includes('Registered tunnel connection')) {
+      if (output.includes('Registered tunnel connection')) registered = true;
+      if (url.length > 0 && registered) {
         finish(url);
       }
     };
@@ -134,21 +157,21 @@ export function startQuickTunnel(options) {
       if (!settled) {
         const detail = tail(output);
         fail(
-          `cloudflared 在拿到公网地址前退出了（code=${code ?? 'null'}）。` +
+          `cloudflared 在完成公网连接注册前退出了（code=${code ?? 'null'}）。` +
           (detail.length > 0 ? `\n${detail}` : ''),
         );
         return;
       }
       if (url.length > 0) {
         log(`Cloudflare 隧道已退出（code=${code ?? 'null'}），下次会重新建立。`);
-        onExit(code);
+        onExit(code, tail(output));
       }
     });
 
     timer = setTimeout(() => {
       const detail = tail(output);
       fail(
-        `等待 Cloudflare 公网地址超时（${Math.round(timeoutMs / 1000)} 秒）。` +
+        `等待 Cloudflare 公网连接注册超时（${Math.round(timeoutMs / 1000)} 秒）。` +
         (detail.length > 0 ? `\n${detail}` : ''),
       );
     }, timeoutMs);

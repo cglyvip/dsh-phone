@@ -16,7 +16,7 @@
  * 依赖注入（spawn/fetch/timer/quickStarter）全部可替换，smoke-test 用 mock 进程覆盖。
  */
 import { spawn } from 'node:child_process';
-import { startQuickTunnel } from '../cloudflare.js';
+import { startQuickTunnel, normalizeCloudflaredProtocol, normalizeCloudflaredDnsResolvers } from '../cloudflare.js';
 import {
   buildFrpcConfig,
   ensureFrpcBinary,
@@ -25,6 +25,10 @@ import {
   writeFrpcConfig,
 } from './frpc.js';
 import { NgrokChannel, ensureNgrokBinary, ngrokHomeDir } from './ngrok.js';
+import { parsePublicUrl, probePublicUrl } from './public-endpoint.js';
+import { BridgeError, ErrorCode } from './errors.js';
+
+export { parsePublicUrl, probePublicUrl } from './public-endpoint.js';
 
 export const TUNNEL_MODES = ['quick', 'named', 'frp', 'custom', 'ngrok', 'relay', 'off'];
 
@@ -44,6 +48,8 @@ export function normalizeTransportConfig(config) {
     cloudflaredPath: typeof raw.cloudflaredPath === 'string' && raw.cloudflaredPath.trim().length > 0
       ? raw.cloudflaredPath.trim()
       : 'cloudflared',
+    cloudflaredProtocol: normalizeCloudflaredProtocol(raw.cloudflaredProtocol),
+    cloudflaredDnsResolvers: normalizeCloudflaredDnsResolvers(raw.cloudflaredDnsResolvers),
     frp: {
       serverAddr: typeof frp.serverAddr === 'string' ? frp.serverAddr.trim() : '',
       serverPort: Number.isInteger(frp.serverPort) && frp.serverPort > 0 ? frp.serverPort : 7000,
@@ -82,8 +88,8 @@ function mergeSecretFields(previous, incoming) {
 export const CHANNEL_LABELS = {
   quick: { label: 'Cloudflare 快速隧道', desc: '免费试用，地址重启会变' },
   named: { label: 'Cloudflare 命名隧道', desc: '固定域名，免费免维护（需在 CF 后台配置）' },
-  frp: { label: 'frp（自建 VPS / OpenFrp / 樱花Frp / Sunny-Ngrok）', desc: 'frp 协议服务商通用；直连长连接，国内 VPS 延迟最低' },
-  custom: { label: '自定义地址', desc: '花生壳 / natapp / cpolar / zrok 等任意工具，粘贴公网地址即可' },
+  frp: { label: '标准 frp / 自建 frps', desc: '使用官方 frpc 连接标准 frps；服务商专用客户端请使用公网地址接入' },
+  custom: { label: '服务商客户端 / 公网地址接入', desc: 'OpenFrp、樱花 Frp、NATAPP、cpolar、zrok 等官方客户端启动后，在此验证公网地址' },
   ngrok: { label: 'ngrok 官方（免费静态域名）', desc: '填 authtoken + 静态域名，桥自动托管 ngrok.exe' },
   relay: { label: '商业中转（订阅）', desc: '下一阶段开放，敬请期待' },
   off: { label: '仅局域网', desc: '手机与电脑同一 Wi-Fi 时使用' },
@@ -272,7 +278,9 @@ export class TransportManager {
     this.fetchBuffer = deps.fetchBuffer;
     this.fetchMeta = deps.fetchMeta;
     this.backoffBaseMs = deps.backoffBaseMs;
+    this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.localPort = 0;
+    this.switching = false;
     this.channel = null;      // 当前通道实例：统一有 snapshot()，进程型通道另有 stop()
   }
 
@@ -283,7 +291,7 @@ export class TransportManager {
   }
 
   /** 停旧起新的底层实现（不持久化）。 */
-  async startChannel(mode) {
+  async startChannel(mode, verifiedEndpoint) {
     await this.stopChannel();
     this.cfg.tunnelMode = mode;
     if (mode === 'off') {
@@ -293,20 +301,29 @@ export class TransportManager {
       };
       return;
     }
-    if (mode === 'named') {
-      const url = this.cfg.publicUrl;
-      if (url.length === 0) {
+    if (mode === 'named' || mode === 'custom') {
+      const url = parsePublicUrl(this.cfg.publicUrl);
+      if (url === null) {
         this.channel = {
-          snapshot: () => ({ status: 'error', url: '', error: 'named 模式需要在桥配置里填写 publicUrl（Cloudflare 后台已配好的固定地址）' }),
+          snapshot: () => ({ status: 'error', url: '', error: '公网地址格式无效：publicUrl 需要指向本机桥的完整 HTTP(S) 或 TCP 地址' }),
           stop: async () => {},
         };
-      } else {
-        this.channel = {
-          snapshot: () => ({ status: 'running', url, error: '' }),
-          stop: async () => {},
-        };
-        this.log(`named 通道就绪：${url}`);
+        return;
       }
+      const state = { status: 'starting', url: '', error: '' };
+      this.channel = { snapshot: () => ({ ...state }), stop: async () => {} };
+      const check = verifiedEndpoint ?? await this.probeEndpoint(url, { timeoutMs: 6000 });
+      if (!check.ok) {
+        state.status = 'error';
+        state.error = check.error;
+        this.notify();
+        return;
+      }
+      this.cfg.publicUrl = url;
+      state.status = 'running';
+      state.url = url;
+      this.log(`${mode} 通道就绪：${url}`);
+      this.notify();
       return;
     }
     if (mode === 'relay') {
@@ -317,40 +334,6 @@ export class TransportManager {
           : { status: 'reserved', url: '', error: '订阅中转服务下一阶段开放（本版仅占位展示）' },
         stop: async () => {},
       };
-      return;
-    }
-    if (mode === 'custom') {
-      // v3.3 §10.1：用户粘贴任意公网地址（花生壳/natapp/cpolar/zrok 等专有工具拿到的），
-      // 桥只存 publicUrl 并探活，不托管任何进程。
-      const url = this.cfg.publicUrl;
-      if (url.length === 0) {
-        this.channel = {
-          snapshot: () => ({
-            status: 'error',
-            url: '',
-            error: 'custom 模式需要先填写公网地址（花生壳/natapp/cpolar/zrok 等工具给出的 http/https 地址）——已降级局域网',
-          }),
-          stop: async () => {},
-        };
-        return;
-      }
-      const parsed = parsePublicUrl(url);
-      if (parsed === null) {
-        this.channel = {
-          snapshot: () => ({
-            status: 'error',
-            url,
-            error: '地址格式无效：必须是 http:// 或 https:// 开头的完整公网地址——已降级局域网',
-          }),
-          stop: async () => {},
-        };
-        return;
-      }
-      this.channel = {
-        snapshot: () => ({ status: 'running', url: parsed, error: '' }),
-        stop: async () => {},
-      };
-      this.log(`custom 通道就绪：${parsed}（可随时用 POST /api/transport/probe 探活）`);
       return;
     }
     if (mode === 'ngrok') {
@@ -401,13 +384,15 @@ export class TransportManager {
         bridgePort: this.localPort,
         targetHost: '127.0.0.1',
         command: this.cfg.cloudflaredPath,
+        protocol: this.cfg.cloudflaredProtocol,
+        dnsResolvers: this.cfg.cloudflaredDnsResolvers,
         timeoutMs: 60_000,
         log: this.log,
-        onExit: () => {
+        onExit: (code, detail) => {
           if (!stopped) {
             state.status = 'stopped';
             state.url = '';
-            state.error = 'cloudflared 已退出';
+            state.error = `cloudflared 已退出（code=${code ?? 'null'}）${detail ? '\n' + detail : ''}`;
             tunnelRef = null;
           }
         },
@@ -475,21 +460,79 @@ export class TransportManager {
    * @param {{ persistFile?: string, params?: { publicUrl?: string, frp?: object, ngrok?: object } }} [options]
    */
   async switchMode(mode, options = {}) {
+    if (this.switching) {
+      throw new BridgeError(ErrorCode.CONFLICT, '上一次通道配置正在验证或切换，请等待完成后重试');
+    }
+    this.switching = true;
+    try {
+      return await this.applyMode(mode, options);
+    } finally {
+      this.switching = false;
+    }
+  }
+
+  async applyMode(mode, options) {
     if (!TUNNEL_MODES.includes(mode)) {
       throw new Error(`tunnelMode 必须是 ${TUNNEL_MODES.join(' / ')} 之一`);
     }
     // 切换时可一并写入通道参数（§10.1）：先归一化再生效，保证非法值被清成默认
     const params = options.params !== null && typeof options.params === 'object' ? options.params : null;
+    let verifiedEndpoint;
+    let publicUrl;
+    if (mode === 'custom' || mode === 'named') {
+      const requestedUrl = typeof params?.publicUrl === 'string' ? params.publicUrl : this.cfg.publicUrl;
+      publicUrl = parsePublicUrl(requestedUrl);
+      if (publicUrl === null) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '公网地址格式无效，请填写指向本机桥的 HTTP(S) 或 TCP 地址；当前连接未改变');
+      }
+      const active = this.status();
+      if (['quick', 'frp', 'ngrok'].includes(active.tunnelMode)
+        && parsePublicUrl(active.tunnelUrl) === publicUrl) {
+        throw new BridgeError(ErrorCode.CONFLICT, '该地址来自当前由桥托管的通道，切换会关闭它；请保持当前通道，或填写独立客户端生成的地址');
+      }
+      verifiedEndpoint = await this.probeEndpoint(publicUrl, { timeoutMs: 6000 });
+      if (!verifiedEndpoint.ok) {
+        throw new BridgeError(ErrorCode.BRIDGE_OFFLINE, `公网桥验证失败：${verifiedEndpoint.error}；当前连接未改变`);
+      }
+    }
+    if (mode === 'frp') {
+      const incoming = params?.frp;
+      const requestedFrp = normalizeTransportConfig({
+        frp: incoming !== null && typeof incoming === 'object'
+          ? mergeSecretFields(this.cfg.frp, { ...this.cfg.frp, ...incoming })
+          : this.cfg.frp,
+      }).frp;
+      try {
+        if (requestedFrp.serverPort > 65535 || requestedFrp.remotePort > 65535) {
+          throw new Error('frp 端口必须在 1 到 65535 之间，remotePort 可为 0');
+        }
+        buildFrpcConfig({ ...requestedFrp, localPort: this.localPort });
+      } catch (error) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, `${error.message}；当前连接未改变`);
+      }
+    }
+    if (mode === 'ngrok') {
+      const incoming = params?.ngrok;
+      const requestedNgrok = normalizeTransportConfig({
+        ngrok: incoming !== null && typeof incoming === 'object'
+          ? mergeSecretFields(this.cfg.ngrok, { ...this.cfg.ngrok, ...incoming })
+          : this.cfg.ngrok,
+      }).ngrok;
+      if (requestedNgrok.authtoken.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, 'ngrok 缺少 authtoken；当前连接未改变');
+      }
+    }
     if (params !== null) {
       if (typeof params.publicUrl === 'string') this.cfg.publicUrl = params.publicUrl.trim();
       // 表单留空的字段沿用已保存的值：token / authtoken 页面不回显，留空即「不修改」
       if (params.frp !== null && typeof params.frp === 'object') {
-        this.cfg.frp = normalizeTransportConfig({ frp: mergeSecretFields(this.cfg.frp, params.frp) }).frp;
+        this.cfg.frp = normalizeTransportConfig({ frp: mergeSecretFields(this.cfg.frp, { ...this.cfg.frp, ...params.frp }) }).frp;
       }
       if (params.ngrok !== null && typeof params.ngrok === 'object') {
-        this.cfg.ngrok = normalizeTransportConfig({ ngrok: mergeSecretFields(this.cfg.ngrok, params.ngrok) }).ngrok;
+        this.cfg.ngrok = normalizeTransportConfig({ ngrok: mergeSecretFields(this.cfg.ngrok, { ...this.cfg.ngrok, ...params.ngrok }) }).ngrok;
       }
     }
+    if (publicUrl !== undefined) this.cfg.publicUrl = publicUrl;
     this.log(`切换公网通道：${this.cfg.tunnelMode} → ${mode}`);
     await this.stopChannel();
     this.cfg.tunnelMode = mode;
@@ -514,7 +557,7 @@ export class TransportManager {
         this.log(`通道选择持久化失败: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    await this.startChannel(mode);
+    await this.startChannel(mode, verifiedEndpoint);
     return this.status();
   }
 
@@ -583,62 +626,3 @@ export class TransportManager {
 }
 
 export default TransportManager;
-
-/**
- * 校验并归一化一个公网地址（custom 模式 / 探活共用）。
- * 必须是 http:// 或 https:// 开头的完整 URL；返回去掉尾部斜杠的规范化地址，非法返回 null。
- */
-export function parsePublicUrl(url) {
-  const text = typeof url === 'string' ? url.trim() : '';
-  if (text.length === 0) return null;
-  let parsed;
-  try {
-    parsed = new URL(text);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  if (parsed.hostname.length === 0) return null;
-  return `${parsed.protocol}//${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`.replace(/\/+$/, '');
-}
-
-/**
- * 探活一个公网地址（contract §10.1）：GET <url>/api/health，3 秒超时。
- * custom 模式粘贴地址后的即时验证用；不跟随业务语义，只看 HTTP 状态可达性。
- * @param {string} url 公网地址（http/https）
- * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number }} [options]
- * @returns {Promise<{ok: boolean, status: number, latencyMs: number, error?: string}>}
- */
-export async function probePublicUrl(url, options = {}) {
-  const started = Date.now();
-  const normalized = parsePublicUrl(url);
-  const latencyMs = () => Date.now() - started;
-  if (normalized === null) {
-    return { ok: false, status: 0, latencyMs: latencyMs(), error: '地址格式无效：必须是 http:// 或 https:// 开头的完整 URL' };
-  }
-  const target = `${normalized}/api/health`;
-  const timeoutMs = Number.isInteger(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 3000;
-  const doFetch = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch;
-  try {
-    const response = await doFetch(target, {
-      method: 'GET',
-      cache: 'no-store',
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { 'User-Agent': 'dsh-phone-bridge-probe' },
-    });
-    // 读完 body 避免连接悬挂（状态码即结论，不关心内容）
-    await response.arrayBuffer().catch(() => {});
-    const ok = response.status >= 200 && response.status < 300;
-    return {
-      ok,
-      status: response.status,
-      latencyMs: latencyMs(),
-      ...(ok ? {} : { error: `目标返回 HTTP ${response.status}——地址可达，但 /api/health 不正常（确认地址指向本桥）` }),
-    };
-  } catch (error) {
-    const message = error instanceof Error
-      ? (error.name === 'TimeoutError' || error.name === 'AbortError' ? `探活超时（${timeoutMs}ms）` : error.message)
-      : String(error);
-    return { ok: false, status: 0, latencyMs: latencyMs(), error: message };
-  }
-}

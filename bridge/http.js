@@ -24,6 +24,7 @@ import {
   sendJson,
 } from './errors.js';
 import send from 'send';
+import { timingSafeEqual } from 'node:crypto';
 import { probePublicUrl, TUNNEL_MODES } from './transport.js';
 
 /**
@@ -62,7 +63,7 @@ function matchRoute(routes, method, pathname) {
  * }} deps
  */
 export function createHttpHandler(deps) {
-  const { adapter, eventHub, tokens, pairing, transport, transportPersistFile, config, log } = deps;
+  const { adapter, eventHub, tokens, pairing, transport, transportPersistFile, localControlToken, config, log } = deps;
 
   const routes = [
     { method: 'GET', pattern: /^\/api\/health$/, handler: handleHealth },
@@ -70,8 +71,8 @@ export function createHttpHandler(deps) {
     { method: 'POST', pattern: /^\/api\/pair$/, handler: handlePair, open: true },
     { method: 'GET', pattern: /^\/api\/pairing-code$/, handler: handlePairingCode, open: true, loopbackOnly: true },
     { method: 'GET', pattern: /^\/api\/transport$/, handler: handleTransportStatus },
-    { method: 'POST', pattern: /^\/api\/transport\/mode$/, handler: handleTransportSwitch, loopbackOnly: true },
-    { method: 'POST', pattern: /^\/api\/transport\/probe$/, handler: handleTransportProbe, loopbackOnly: true },
+    { method: 'POST', pattern: /^\/api\/transport\/mode$/, handler: handleTransportSwitch, loopbackOnly: true, localControl: true },
+    { method: 'POST', pattern: /^\/api\/transport\/probe$/, handler: handleTransportProbe, loopbackOnly: true, localControl: true },
     { method: 'GET', pattern: /^\/api\/sessions$/, handler: handleListSessions },
     { method: 'POST', pattern: /^\/api\/sessions$/, handler: handleCreateSession },
     { method: 'POST', pattern: /^\/api\/sessions\/batch-delete$/, handler: handleBatchDelete },
@@ -522,6 +523,18 @@ export function createHttpHandler(deps) {
     return typeof fromQuery === 'string' ? fromQuery : '';
   }
 
+  function hasLocalControlToken(request, route) {
+    if (route.localControl !== true || route.loopbackOnly !== true
+      || typeof localControlToken !== 'string' || localControlToken.length === 0) {
+      return false;
+    }
+    const submitted = request.headers['x-dsh-local-control-token'];
+    if (typeof submitted !== 'string') return false;
+    const actual = Buffer.from(submitted, 'utf8');
+    const expected = Buffer.from(localControlToken, 'utf8');
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  }
+
   /**
    * 返回 (req, res) => Promise<void> 的处理器。
    */
@@ -576,7 +589,7 @@ export function createHttpHandler(deps) {
           throw new BridgeError(ErrorCode.ROUTE_LOCAL_ONLY, '该接口仅限本机访问');
         }
       }
-      if (route.open !== true) {
+      if (route.open !== true && !hasLocalControlToken(request, route)) {
         const token = readToken(request, url);
         if (token.length === 0) {
           throw new BridgeError(ErrorCode.AUTH_REQUIRED, '缺少访问令牌');

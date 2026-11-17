@@ -4,9 +4,17 @@
 > 类型定义见同目录 `types.ts`；鸿蒙端的镜像类型在
 > `DSH-hm/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
 
-- 桥版本：`3.5.0`
+- 桥版本：`3.6.0`
 - 契约版本：`3`（`MIN_CONTRACT_VERSION = 3`）
 - 协议名：`dsh-phone-bridge`
+
+### 3.6.0 公网接入补充
+
+`POST /api/transport/probe` 支持根地址形式的 HTTP、HTTPS 和 `tcp://主机:端口`；TCP 地址会转换为 HTTP。
+探活须返回桥身份、`status: ok` 与兼容的 `contractVersion`，不接受登录页、广告页或重定向。
+公网端点还须阻止外部读取 `/api/pairing-code`。成功结果可附带 `bridgeVersion` 与 `contractVersion`。
+`named` 或 `custom` 切换前验证失败时，接口返回错误且保留当前通道与持久配置。
+配对页使用每次桥启动生成、仅对本机通道接口有效的专用凭据；手机业务接口仍使用配对所得 Bearer 令牌。
 
 ---
 

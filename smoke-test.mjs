@@ -24,6 +24,7 @@ import { ensureNgrokBinary, extractNgrokFromZip, ngrokReleaseInfo, parseNgrokLin
 import { probePublicUrl } from './bridge/transport.js';
 import { BRIDGE_VERSION } from './shared/version.js';
 import { FRP_PROVIDERS, pairHtml } from './pair.js';
+import { TUNNEL_PROVIDERS } from './shared/tunnel-providers.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
@@ -1486,6 +1487,7 @@ async function main() {
     home: frpcHomeE,
     log: frpLog,
     quickStarter,
+    probeEndpoint: async () => ({ ok: true, status: 200, latencyMs: 1 }),
     spawnImpl: makeFrpcSpawner({
       lines: ['2026/11/14 10:00:00 [I] [proxy] [dsh-phone-bridge] start proxy success remotePort=34567'],
       exitAfterMs: -1,
@@ -1516,6 +1518,7 @@ async function main() {
     config: normalizeTransportConfig({ tunnelMode: 'named', publicUrl: '' }),
     home: frpcHomeE,
     log: frpLog,
+    probeEndpoint: async () => ({ ok: true, status: 200, latencyMs: 1 }),
   });
   await transportH.start({ localPort: 8787 });
   const namedError = transportH.status();
@@ -1555,6 +1558,7 @@ async function main() {
     config: normalizeTransportConfig({ tunnelMode: 'custom', publicUrl: 'https://my-abc.oophz.com:12345/' }),
     home: frpcHomeE,
     log: frpLog,
+    probeEndpoint: async () => ({ ok: true, status: 200, latencyMs: 1 }),
   });
   await transportCustom.start({ localPort: 8787 });
   const customStatus = transportCustom.status();
@@ -1590,7 +1594,8 @@ async function main() {
   assert.equal(probeOk.ok, true, '探活本桥 /api/health 应可达');
   assert.equal(probeOk.status, 200);
   assert.ok(Number.isFinite(probeOk.latencyMs) && probeOk.latencyMs >= 0);
-  assert.deepEqual(Object.keys(probeOk).sort(), ['latencyMs', 'ok', 'status'], '结果形状按 TransportProbeResult');
+  assert.equal(probeOk.contractVersion, 3);
+  assert.equal(probeOk.bridgeVersion, BRIDGE_VERSION);
   const probeDead = await probePublicUrl('http://127.0.0.1:9', { timeoutMs: 1000 });
   assert.equal(probeDead.ok, false);
   assert.ok(typeof probeDead.error === 'string' && probeDead.error.length > 0, '不可达应有 error 说明');
@@ -1715,14 +1720,14 @@ async function main() {
   pass('ngrok 下载双校验 + zip 抽取 + 日志行解析');
 
   // 32) v3.3 §10.1：frp 服务商预设模板数据完整性（配对页展示层）
-  assert.equal(FRP_PROVIDERS.length, 4);
-  assert.deepEqual(FRP_PROVIDERS.map((provider) => provider.id), ['self', 'openfrp', 'natfrp', 'sunny-ngrok']);
+  assert.equal(FRP_PROVIDERS.length, 1);
+  assert.deepEqual(FRP_PROVIDERS.map((provider) => provider.id), ['self']);
   for (const provider of FRP_PROVIDERS) {
-    assert.ok(provider.name.length > 0 && provider.url.startsWith('https://'), '每个预设要有名称与官方入口 URL');
+    assert.ok(provider.name.length > 0 && provider.docs.startsWith('https://'), '每个预设要有名称与官方文档 URL');
     assert.ok(provider.fields.includes('remotePort'), '字段说明应覆盖 remotePort');
     assert.ok(provider.notes.length > 0, '每个预设要有注意事项');
   }
-  assert.ok(FRP_PROVIDERS.find((provider) => provider.id === 'openfrp').notes.includes('面板'), 'OpenFrp 注意事项应提示面板建隧道');
+  assert.equal(TUNNEL_PROVIDERS.find((provider) => provider.id === 'openfrp').mode, 'custom');
   const providerRender = pairHtml({
     lanUrl: 'ws://192.168.1.5:8787',
     channels: {
@@ -1776,17 +1781,22 @@ async function main() {
   assert.ok(!JSON.stringify(ngrokHttpStatus.json).includes('http-token-331'), '通道状态接口不回显 authtoken');
   const customSwitch = await request(port, 'POST', '/api/transport/mode', {
     token,
-    body: { tunnelMode: 'custom', publicUrl: 'https://pasted.example.com:9999' },
+    body: { tunnelMode: 'custom', publicUrl: `tcp://127.0.0.1:${port}` },
   });
   assert.equal(customSwitch.status, 200);
   assert.equal(customSwitch.json.channels.custom.status, 'running');
-  assert.equal(customSwitch.json.channels.custom.url, 'https://pasted.example.com:9999');
+  assert.equal(customSwitch.json.channels.custom.url, `http://127.0.0.1:${port}`);
+  const savedCustom = JSON.parse(readFileSync(join(tmpDir, 'transport.json'), 'utf8'));
+  assert.equal(savedCustom.publicUrl, `http://127.0.0.1:${port}`);
   const emptyCustomSwitch = await request(port, 'POST', '/api/transport/mode', {
     token,
     body: { tunnelMode: 'custom', publicUrl: '' },
   });
-  assert.equal(emptyCustomSwitch.status, 200);
-  assert.equal(emptyCustomSwitch.json.channels.custom.status, 'error', 'custom 缺地址 → 降级并在卡片显示错误');
+  assert.equal(emptyCustomSwitch.status, 400);
+  const unchangedCustom = await request(port, 'GET', '/api/transport', { token });
+  assert.equal(unchangedCustom.json.tunnelMode, 'custom');
+  assert.equal(unchangedCustom.json.tunnelStatus, 'running');
+  assert.equal(unchangedCustom.json.tunnelUrl, `http://127.0.0.1:${port}`);
   // frp 带参数切换（配对页表单）：参数落盘、token 不回显、留空 token 保持原值
   mkdirSync(join(tmpDir, 'phone-bridge', 'frpc'), { recursive: true });
   writeFileSync(join(tmpDir, 'phone-bridge', 'frpc', 'frpc.exe'), 'USER-FRPC');
@@ -1814,6 +1824,40 @@ async function main() {
   const persistedFrp2 = JSON.parse(readFileSync(join(tmpDir, 'transport.json'), 'utf8'));
   assert.equal(persistedFrp2.frp.token, 'frp-http-token-33', '留空 token 应保留原值而不是清空');
   assert.equal(persistedFrp2.frp.remotePort, 27002, '其它字段仍按表单更新');
+  const controlPage = await request(port, 'GET', '/pair');
+  assert.equal(controlPage.status, 200);
+  const controlTokenMatch = controlPage.text.match(/'X-DSH-Local-Control-Token':\s*"([A-Za-z0-9_-]+)"/);
+  assert.ok(controlTokenMatch, '本机配对页必须提供当前进程的通道控制凭据');
+  const localControlHeaders = { 'X-DSH-Local-Control-Token': controlTokenMatch[1] };
+  const pageSwitch = await request(port, 'POST', '/api/transport/mode', {
+    headers: localControlHeaders,
+    body: { tunnelMode: 'off' },
+  });
+  assert.equal(pageSwitch.status, 200, '配对页无需先给手机配对即可配置公网通道');
+  assert.equal(pageSwitch.json.tunnelMode, 'off');
+  const noControlSwitch = await request(port, 'POST', '/api/transport/mode', { body: { tunnelMode: 'off' } });
+  assert.equal(noControlSwitch.status, 401, '本机控制接口仍需有效凭据');
+  const badControlSwitch = await request(port, 'POST', '/api/transport/mode', {
+    headers: { 'X-DSH-Local-Control-Token': 'invalid' }, body: { tunnelMode: 'off' },
+  });
+  assert.equal(badControlSwitch.status, 401);
+  const controlSessions = await request(port, 'GET', '/api/sessions', { headers: localControlHeaders });
+  assert.equal(controlSessions.status, 401, '页面控制凭据不能访问用户会话');
+  const tunneledControl = await rawRequest('POST', '/api/transport/mode', {
+    ...localControlHeaders, Host: 'dsh-phone-bridge-tunnel', 'Content-Type': 'application/json',
+  }, JSON.stringify({ tunnelMode: 'off' }));
+  assert.equal(tunneledControl.status, 403, '页面控制凭据不能绕过公网来源限制');
+  const remoteHostControl = await rawRequest('POST', '/api/transport/mode', {
+    ...localControlHeaders, Host: 'public.example.com', 'Content-Type': 'application/json',
+  }, JSON.stringify({ tunnelMode: 'off' }));
+  assert.equal(remoteHostControl.status, 403);
+  const pageProbe = await request(port, 'POST', '/api/transport/probe', {
+    headers: localControlHeaders, body: { url: `http://127.0.0.1:${port}` },
+  });
+  assert.equal(pageProbe.status, 200);
+  assert.ok(!JSON.stringify(pageSwitch.json).includes(controlTokenMatch[1]));
+  assert.ok(!JSON.stringify(health.json).includes(controlTokenMatch[1]));
+  pass('配对页本机通道控制（无手机令牌可配置 / 错误凭据拒绝 / 远端拒绝 / 会话隔离）');
   const hackerMode = await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'hacker' } });
   assert.equal(hackerMode.status, 400);
   await request(port, 'POST', '/api/transport/mode', { token, body: { tunnelMode: 'off' } });

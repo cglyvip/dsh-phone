@@ -386,4 +386,6 @@ export interface TransportProbeResult {
   status: number;
   latencyMs: number;
   error?: string;
+  bridgeVersion?: string;
+  contractVersion?: number;
 }

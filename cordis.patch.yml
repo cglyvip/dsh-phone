@@ -44,5 +44,7 @@
         # Cloudflare 快速隧道：off / pair（执行 /pair 时启动）/ startup（启动即开）
         cloudflareTunnel: off
         cloudflaredPath: cloudflared
+        cloudflaredProtocol: auto
+        cloudflaredDnsResolvers: []
         # 日志级别：info / silent
         logLevel: info

@@ -17,6 +17,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 import { BRIDGE_VERSION, CONTRACT_VERSION, MIN_CONTRACT_VERSION, PROTOCOL } from './shared/version.js';
 import { BridgeError, ErrorCode, asBridgeError, sendJson, sendText } from './bridge/errors.js';
@@ -27,6 +28,7 @@ import { EventHub } from './bridge/eventhub.js';
 import { TransportManager, TUNNEL_MODES, normalizeTransportConfig } from './bridge/transport.js';
 import { DshAdapter } from './adapter/dsh.js';
 import { lanAddress, pairHtml } from './pair.js';
+import { normalizeCloudflaredProtocol, normalizeCloudflaredDnsResolvers } from './cloudflare.js';
 
 export const name = 'dsh-phone-bridge';
 export const version = BRIDGE_VERSION;
@@ -70,6 +72,8 @@ export function normalize(config) {
       ? raw.cloudflareTunnel
       : 'off',
     cloudflaredPath: typeof raw.cloudflaredPath === 'string' ? raw.cloudflaredPath : 'cloudflared',
+    cloudflaredProtocol: normalizeCloudflaredProtocol(raw.cloudflaredProtocol),
+    cloudflaredDnsResolvers: normalizeCloudflaredDnsResolvers(raw.cloudflaredDnsResolvers),
     tunnelMode,
     frp: {
       serverAddr: typeof frp.serverAddr === 'string' ? frp.serverAddr : '',
@@ -199,6 +203,8 @@ export function apply(ctx, config) {
         tunnelMode: transportOverrides.tunnelMode ?? cfg.tunnelMode,
         publicUrl: transportOverrides.publicUrl ?? cfg.publicUrl,
         cloudflaredPath: cfg.cloudflaredPath,
+        cloudflaredProtocol: cfg.cloudflaredProtocol,
+        cloudflaredDnsResolvers: cfg.cloudflaredDnsResolvers,
         // 浅合并：transport.json 里有的字段优先，缺的字段沿用插件 config
         frp: { ...(cfg.frp ?? {}), ...(transportOverrides.frp ?? {}) },
         ngrok: { ...(cfg.ngrok ?? {}), ...(transportOverrides.ngrok ?? {}) },
@@ -207,6 +213,7 @@ export function apply(ctx, config) {
       home: defaultTokenHome(),
       log,
     });
+    const localControlToken = randomBytes(32).toString('base64url');
 
     const httpHandler = createHttpHandler({
       adapter,
@@ -215,6 +222,7 @@ export function apply(ctx, config) {
       pairing,
       transport,
       transportPersistFile: transportOverrideFile,
+      localControlToken,
       config: cfg,
       log,
     });
@@ -245,7 +253,7 @@ export function apply(ctx, config) {
           minContractVersion: MIN_CONTRACT_VERSION,
           port: state.port,
           lanUrl: lan.length > 0 ? `ws://${lan}:${state.port}` : '',
-          publicUrl: cfg.publicUrl,
+          publicUrl: transport.cfg.publicUrl,
           tunnelMode: transportStatus.tunnelMode,
           tunnelStatus: transportStatus.tunnelStatus,
           tunnelUrl: transportStatus.tunnelUrl,
@@ -281,17 +289,19 @@ export function apply(ctx, config) {
         const lan = lanAddress();
         const lanUrl = lan.length > 0 ? `ws://${lan}:${state.port}` : '';
         const transportStatus = transport.status();
+        response.setHeader('Cache-Control', 'no-store');
         sendText(
           response,
           200,
           pairHtml({
             lanUrl,
-            publicUrl: cfg.publicUrl,
+            publicUrl: transport.cfg.publicUrl,
             tunnelUrl: transportStatus.tunnelUrl,
             channels: transportStatus.channels,
             frp: transport.frpFormValues(),
             currentChannel: transportStatus.tunnelMode,
             transportApiPath: '/api/transport/mode',
+            localControlToken,
             port: state.port,
             clients: state.wsPlane !== null ? state.wsPlane.clients.size : 0,
             code: current.code,
@@ -353,12 +363,9 @@ export function apply(ctx, config) {
           log(`写运行时信息失败: ${error instanceof Error ? error.message : String(error)}`);
         }
 
-        if (cfg.tunnelMode !== 'off') {
-          // 公网通道（quick/named/frp/relay）：失败降级局域网，LAN 永远可用
-          void transport.start({ localPort: port }).catch((error) => {
-            log(`公网通道启动失败（已降级局域网）: ${error instanceof Error ? error.message : String(error)}`);
-          });
-        }
+        void transport.start({ localPort: port }).catch((error) => {
+          log(`公网通道启动失败: ${error instanceof Error ? error.message : String(error)}`);
+        });
       } catch (error) {
         log(`启动失败: ${error instanceof Error ? error.message : String(error)}`);
       }

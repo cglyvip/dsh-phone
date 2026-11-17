@@ -9,6 +9,9 @@
  */
 import os from 'node:os';
 import qrcode from './qr.cjs';
+import { TUNNEL_PROVIDERS, FRP_PROVIDERS, providerCommands } from './shared/tunnel-providers.js';
+
+export { FRP_PROVIDERS } from './shared/tunnel-providers.js';
 
 /** 选一个最可能被手机访问到的局域网 IPv4（优先 192.168 / 10 / 172.16-31）。 */
 export function lanAddress() {
@@ -44,40 +47,9 @@ function escapeHtml(text) {
     .replaceAll('"', '&quot;');
 }
 
-/**
- * frp 服务商预设模板（配对页展示用，不落敏感数据）。
- * OpenFrp / 樱花Frp(natfrp) / Sunny-Ngrok / 宝塔 都是 frp 协议，字段同 self。
- */
-export const FRP_PROVIDERS = [
-  {
-    id: 'self',
-    name: '自建 frps（VPS）',
-    url: 'https://github.com/fatedier/frp',
-    fields: 'serverAddr=VPS 地址 · serverPort=bindPort（默认 7000）· token=frps auth.token · remotePort=自己定的映射端口',
-    notes: '在 VPS 上跑 frps（bindPort + auth.token），安全组放行 bindPort 与 remotePort。',
-  },
-  {
-    id: 'openfrp',
-    name: 'OpenFrp',
-    url: 'https://www.openfrp.net/',
-    fields: 'serverAddr=面板隧道详情里的服务器地址 · serverPort=同页端口 · token=用户密钥 · remotePort=建隧道时分配的远程端口',
-    notes: '需先在 OpenFrp 面板建一条 frp 协议隧道，remotePort 用面板分配的端口，不能填 0。',
-  },
-  {
-    id: 'natfrp',
-    name: '樱花Frp (natfrp)',
-    url: 'https://www.natfrp.com/',
-    fields: 'serverAddr/serverPort/token/remotePort 均以面板「frp 用户版」隧道详情为准',
-    notes: '注意樱花Frp 启动器 token 不是 frp auth.token——按面板隧道详情页给出的四项填写。',
-  },
-  {
-    id: 'sunny-ngrok',
-    name: 'Sunny-Ngrok',
-    url: 'https://www.ngrok.cc/',
-    fields: 'serverAddr=隧道详情服务器地址 · serverPort=同页端口 · token=隧道 token · remotePort=隧道远程端口',
-    notes: '开通 frp 协议隧道后按详情填写；该站另有的 web 协议隧道与本桥无关。',
-  },
-];
+function scriptJson(value) {
+  return JSON.stringify(value).replaceAll('<', '\\u003c');
+}
 
 /**
  * 生成配对页 HTML。
@@ -98,11 +70,35 @@ export function pairHtml(info) {
   const frpConfig = info.frp !== null && typeof info.frp === 'object' ? info.frp : {};
   const currentChannel = typeof info.currentChannel === 'string' ? info.currentChannel : 'off';
   const transportApiPath = typeof info.transportApiPath === 'string' ? info.transportApiPath : '/api/transport/mode';
+  const localControlToken = typeof info.localControlToken === 'string' ? info.localControlToken : '';
   const code = typeof info.code === 'string' ? info.code : '';
   const expiresAt = Number.isFinite(info.expiresAt) ? info.expiresAt : 0;
   const clients = Number.isFinite(info.clients) ? info.clients : 0;
   const bridgeVersion = typeof info.bridgeVersion === 'string' ? info.bridgeVersion : '';
   const contractVersion = Number.isFinite(info.contractVersion) ? info.contractVersion : 0;
+  const providerCatalog = TUNNEL_PROVIDERS.map(provider => ({
+    ...provider,
+    requirements: provider.requirements.map(requirement => requirement.replaceAll('{port}', String(info.port))),
+    steps: provider.steps.map(step => step.replaceAll('{port}', String(info.port))),
+    resolvedCommands: providerCommands(provider.id, info.port),
+  }));
+  const providerOptions = providerCatalog.map(provider =>
+    `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`).join('');
+  const providerGuides = providerCatalog.map(provider => `
+    <section class="provider-guide" data-provider-guide="${escapeHtml(provider.id)}" hidden>
+      <div class="provider-title">${escapeHtml(provider.name)}<span class="provider-kind">${provider.managed ? '桥托管官方客户端' : '官方客户端接入'}</span></div>
+      <p class="provider-free">${escapeHtml(provider.freePlan)}</p>
+      <div class="provider-links"><a href="${escapeHtml(provider.homepage)}" target="_blank" rel="noopener noreferrer">官方网站 ↗</a><a href="${escapeHtml(provider.docs)}" target="_blank" rel="noopener noreferrer">接入文档 ↗</a></div>
+      <div class="provider-target">本机目标：<code>http://127.0.0.1:${escapeHtml(String(info.port))}</code></div>
+      <div class="provider-label">开始前准备</div>
+      <ul>${provider.requirements.map(requirement => `<li>${escapeHtml(requirement)}</li>`).join('')}</ul>
+      <div class="provider-label">接入步骤</div>
+      <ol>${provider.steps.map(step => `<li>${escapeHtml(step)}</li>`).join('')}</ol>
+      ${provider.resolvedCommands.map((command, commandIndex) => `
+      <div class="provider-command"><pre>${escapeHtml(command)}</pre><button type="button" class="provider-copy" data-provider-command="${escapeHtml(provider.id)}" data-command-index="${commandIndex}">复制命令</button></div>`).join('')}
+      ${provider.mode === 'custom' ? '<p class="provider-note">先用服务商官方客户端建立隧道，再把它给出的 HTTP / HTTPS 或 TCP 公网地址粘贴到下方。服务商启动密钥不要填进标准 frp 的 token 框。</p>' : ''}
+      ${provider.mode === 'ngrok' ? '<p class="provider-note">免费方案可能有流量限制或浏览器提示页；保存前会验证地址是否直达手机桥，而不是广告或确认页面。</p>' : ''}
+    </section>`).join('');
 
   const primaryUrl = publicUrl.length > 0 && (currentChannel === 'named' || currentChannel === 'relay')
     ? publicUrl
@@ -143,12 +139,20 @@ export function pairHtml(info) {
       ? `<div class="ch-url">${escapeHtml(channel.url)}</div>`
       : (channel.error.length > 0 ? `<div class="ch-err">${escapeHtml(channel.error)}</div>` : '');
     let extra = '';
+    if (id === 'named') {
+      extra = `
+      <div class="ch-form">
+        <input id="named-url" class="ch-input" type="text" placeholder="填写已配置到本机桥的 HTTPS 固定域名" autocomplete="off" value="${escapeHtml(publicUrl)}" aria-label="Cloudflare 固定域名">
+        <button class="ch-btn" data-mode="named" data-url-input="named-url">验证并切换</button>
+        <div class="ch-desc">需先在 Cloudflare 面板与官方客户端配置公开主机名，源站指向 http://127.0.0.1:${escapeHtml(String(info.port))}。填域名不会代替客户端建立隧道。</div>
+      </div>`;
+    }
     if (id === 'frp') {
       const providerRows = FRP_PROVIDERS.map((provider) => `
         <div class="pv">
-          <div class="pv-head"><a class="pv-link" href="${escapeHtml(provider.url)}" target="_blank" rel="noreferrer">${escapeHtml(provider.name)} ↗</a></div>
-          <div class="pv-fields">${escapeHtml(provider.fields)}</div>
-          <div class="pv-notes">${escapeHtml(provider.notes)}</div>
+          <div class="pv-head"><a class="pv-link" href="${escapeHtml(provider.docs)}" target="_blank" rel="noopener noreferrer">${escapeHtml(provider.name)} ↗</a></div>
+          <div class="pv-fields">${provider.requirements.map(requirement => escapeHtml(requirement)).join(' · ')}</div>
+          <div class="pv-notes">只接受标准 frps 的服务器参数与 auth.token。OpenFrp、樱花Frp等服务商的启动密钥请按上方服务商指引接入。</div>
         </div>`).join('\n');
       // frp 参数表单：换电脑时只改这一处即可，token 只落 transport.json（600）不回显
       const frpCfg = frpConfig !== null && typeof frpConfig === 'object' ? frpConfig : {};
@@ -166,39 +170,40 @@ export function pairHtml(info) {
         <input id="frp-token" class="ch-input" type="password" placeholder="${frpHasToken ? 'token 已保存，留空则不修改' : 'token：frps 的 auth.token（必填）'}" autocomplete="off">
         <label class="ch-check"><input id="frp-use-tls" type="checkbox"${frpCfg.useTls === true ? ' checked' : ''}> 启用 TLS（frps 开了 transport.tls 才勾）</label>
         <button class="ch-btn" data-mode="frp" data-frp="1">保存并切换</button>
-        <div class="ch-desc">切换后桥自动下载托管 frpc.exe；token 只落 transport.json（600），不回显。remotePort 填 0 时由 frps 随机分配。</div>
+        <div class="ch-desc">仅用于自建或明确支持原版 frpc 的标准 frps。切换后托管官方 frpc；token 只保存在本机。remotePort 填 0 时由 frps 分配。</div>
       </div>
       <details class="ch-extra">
-        <summary>服务商预设（全是 frp 协议，字段同上面的表单）</summary>
+        <summary>标准 frp 服务商预设与配置说明</summary>
         ${providerRows}
       </details>`;
     }
     if (id === 'custom') {
       extra = `
       <div class="ch-form">
-        <input id="custom-url" class="ch-input" type="url" placeholder="粘贴公网地址，如 https://xxx.oray.com:12345" autocomplete="off">
+        <input id="custom-url" class="ch-input" type="text" placeholder="公网地址：https://域名 或 tcp://域名:端口" autocomplete="off" value="${escapeHtml(publicUrl)}" aria-label="服务商分配的公网地址">
         <div class="ch-form-row">
-          <button class="ch-btn ch-btn-secondary" id="custom-probe" data-probe="1">探活</button>
-          <button class="ch-btn" data-mode="custom" data-url-input="custom-url">填好并切换</button>
+          <button class="ch-btn ch-btn-secondary" id="custom-probe" data-probe="1">验证手机桥</button>
+          <button class="ch-btn" data-mode="custom" data-url-input="custom-url">验证并切换</button>
         </div>
         <span class="probe-badge" id="custom-probe-result"></span>
+        <div class="ch-desc">支持官方客户端输出的 HTTP、HTTPS、TCP 地址，需同时转发 HTTP 与 WebSocket。验证失败不会切走当前通道。</div>
       </div>`;
     }
     if (id === 'ngrok') {
       extra = `
       <div class="ch-form">
         <input id="ngrok-authtoken" class="ch-input" type="password" placeholder="authtoken（dashboard.ngrok.com 获取）" autocomplete="off">
-        <input id="ngrok-domain" class="ch-input" type="text" placeholder="静态域名，如 my-bridge.ngrok.app" autocomplete="off">
+        <input id="ngrok-domain" class="ch-input" type="text" placeholder="域名选填；留空使用账号的免费开发域名" autocomplete="off">
         <button class="ch-btn" data-mode="ngrok" data-ngrok="1">保存并切换</button>
         <div class="ch-desc">切换后桥自动下载托管 ngrok.exe（用户手放 ~/.dsh/phone-bridge/ngrok/ 优先）；authtoken 只落 transport.json，不回显。</div>
       </div>`;
     }
     // 带表单的卡片（frp/custom/ngrok）按钮由表单自己渲染，避免出现两个切换按钮
-    const switchButton = (id === 'frp' || id === 'custom' || id === 'ngrok')
+    const switchButton = (id === 'frp' || id === 'custom' || id === 'ngrok' || id === 'named')
       ? ''
       : `${active ? '' : `<button class="ch-btn" data-mode="${id}"${channel.status === 'reserved' ? ' disabled' : ''}>切换到此通道</button>`}`;
     return `
-    <div class="ch${active ? ' ch-active' : ''}" id="ch-${id}" style="--bar:${visual.color}">
+    <div class="ch${active ? ' ch-active' : ''}" id="ch-${id}" data-channel="${id}" style="--bar:${visual.color}">
       <div class="ch-head">
         <span class="ch-ico"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">${visual.icon}</svg></span>
         <span class="ch-name">${escapeHtml(channel.label ?? id)}</span>
@@ -308,6 +313,21 @@ export function pairHtml(info) {
   .pv-link { color: var(--brand); font-weight: 600; font-size: 12px; text-decoration: none; }
   .pv-fields { color: var(--text); font-size: 12px; margin-top: 4px; word-break: break-all; }
   .pv-notes { color: var(--text-2); font-size: 12px; margin-top: 2px; }
+  [hidden] { display: none !important; }
+  .provider-guide { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .provider-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; }
+  .provider-kind { background: var(--brand-soft); color: var(--brand-deep); border-radius: 4px; font-size: 11px; padding: 2px 6px; }
+  .provider-free, .provider-note { margin: 8px 0; color: var(--text-2); font-size: 12px; }
+  .provider-note { border-left: 2px solid var(--brand); padding-left: 8px; }
+  .provider-links { display: flex; gap: 16px; margin-bottom: 10px; font-size: 12px; }
+  .provider-links a { color: var(--brand); }
+  .provider-target { font-size: 12px; padding: 8px; background: var(--bg); border-radius: 6px; word-break: break-all; }
+  .provider-label { font-size: 12px; font-weight: 600; color: var(--text); margin-top: 10px; }
+  .provider-guide ul { margin: 5px 0 0; padding-left: 20px; color: var(--text-2); font-size: 12px; }
+  .provider-guide li { margin: 4px 0; }
+  .provider-command { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: var(--bg); }
+  .provider-command pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+  .provider-copy { margin-top: 4px; width: auto; min-height: 40px; padding: 6px 10px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -331,7 +351,17 @@ export function pairHtml(info) {
   </div>
 
   <div class="card">
-    <div class="sub" style="margin-bottom:10px">公网通道（手机在外网也能连；任选其一，随时切换。建议：国内 VPS 用 frp 延迟最低，ngrok 免费静态域名，花生壳/natapp/cpolar 等已跑通的工具选「自定义地址」粘贴即可）</div>
+    <h1>选择穿透服务</h1>
+    <p class="sub" style="margin-bottom:8px">先查看服务商条件与步骤，再配置下面的接入通道。选择服务商不会自动安装、运行命令或切换连接。</p>
+    <select id="provider-select" class="ch-input" aria-label="选择内网穿透服务">
+      <option value="">查看全部通道</option>
+      ${providerOptions}
+    </select>
+    ${providerGuides}
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:10px">公网通道。标准 frps 用「标准 frp」；需要专用启动器的服务商用「自定义地址」，不要混用密钥。免费方案的额度、实名要求与可用节点以服务商当前说明为准。</div>
     ${channelCards}
   </div>
 
@@ -347,8 +377,36 @@ export function pairHtml(info) {
   <div class="foot">DeepSeek Harness 手机桥 · 仅本机可打开此页面</div>
 
 <script>
-  const primary = ${JSON.stringify(primaryUrl)};
+  const primary = ${scriptJson(primaryUrl)};
+  const providerCatalog = ${scriptJson(providerCatalog.map(provider => ({ id: provider.id, mode: provider.mode, commands: provider.resolvedCommands })))};
+  const localControlHeaders = {
+    'Content-Type': 'application/json',
+    'X-DSH-Local-Control-Token': ${JSON.stringify(localControlToken)},
+  };
   const copyBtn = document.getElementById('copy');
+  const providerSelect = document.getElementById('provider-select');
+  providerSelect.addEventListener('change', () => {
+    const selectedProvider = providerCatalog.find(provider => provider.id === providerSelect.value);
+    document.querySelectorAll('[data-provider-guide]').forEach(guide => {
+      guide.hidden = guide.getAttribute('data-provider-guide') !== providerSelect.value;
+    });
+    document.querySelectorAll('[data-channel]').forEach(channel => {
+      channel.hidden = selectedProvider !== undefined && channel.getAttribute('data-channel') !== selectedProvider.mode;
+    });
+  });
+  document.querySelectorAll('[data-provider-command]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const provider = providerCatalog.find(candidate => candidate.id === button.getAttribute('data-provider-command'));
+      const commandIndex = Number(button.getAttribute('data-command-index'));
+      if (provider === undefined || !Number.isInteger(commandIndex) || commandIndex < 0 || commandIndex >= provider.commands.length) return;
+      try {
+        await navigator.clipboard.writeText(provider.commands[commandIndex]);
+        button.textContent = '命令已复制';
+      } catch (error) {
+        button.textContent = '复制失败，请手动选择命令';
+      }
+    });
+  });
   copyBtn.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(primary);
@@ -399,7 +457,7 @@ export function pairHtml(info) {
       try {
         const res = await fetch(${JSON.stringify(transportApiPath)}, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: localControlHeaders,
           body: JSON.stringify(payload),
         });
         if (!res.ok) {
@@ -428,7 +486,7 @@ export function pairHtml(info) {
       try {
         const res = await fetch('/api/transport/probe', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: localControlHeaders,
           body: JSON.stringify({ url }),
         });
         const data = await res.json().catch(() => null);
@@ -438,7 +496,7 @@ export function pairHtml(info) {
           return;
         }
         if (data.ok === true) {
-          badge.textContent = '可达 ✓ HTTP ' + data.status + ' · ' + data.latencyMs + 'ms';
+          badge.textContent = '已确认手机桥 ✓ HTTP ' + data.status + ' · ' + data.latencyMs + 'ms';
           badge.classList.add('probe-ok');
           return;
         }
