@@ -21,6 +21,15 @@ function Get-JsonObject {
     return $property.Value
 }
 
+function Read-JsonFile {
+    # 必须显式按 UTF-8 读取：Windows PowerShell 5.1 的 Get-Content 默认用系统 ANSI 编码
+    # （中文系统是 gb2312），而 package.json 是无 BOM 的 UTF-8，中文描述会变成乱码，
+    # ConvertFrom-Json 随即报「无效的 JSON 基元」。
+    param([string]$Path)
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return $text | ConvertFrom-Json
+}
+
 function Assert-ChildPath {
     param([string]$Path, [string]$Root)
 
@@ -64,7 +73,14 @@ function Assert-TreeNoReparsePoint {
 
 $nodeCommand = (Get-Command node.exe -ErrorAction Stop).Source
 $npmCommand = (Get-Command npm.cmd -ErrorAction Stop).Source
-$tarCommand = (Get-Command tar.exe -ErrorAction Stop).Source
+# 优先用系统自带的 bsdtar（System32\tar.exe）。PATH 里如果有 Git 的 GNU tar，
+# 它会把 `C:\...` 当成 `主机:路径` 解析，报「Cannot connect to C: resolve failed」。
+$systemTar = Join-Path $env:SystemRoot 'System32\tar.exe'
+$tarCommand = if (Test-Path -LiteralPath $systemTar) {
+    $systemTar
+} else {
+    (Get-Command tar.exe -ErrorAction Stop).Source
+}
 $nodeVersion = & $nodeCommand -p 'process.versions.node'
 if ($LASTEXITCODE -ne 0 -or [int]$nodeVersion.Split('.')[0] -lt 20) {
     throw 'Install Node.js 20 or later before installing this plugin.'
@@ -72,7 +88,7 @@ if ($LASTEXITCODE -ne 0 -or [int]$nodeVersion.Split('.')[0] -lt 20) {
 
 $sourceRoot = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path
 $sourceManifestPath = Join-Path $sourceRoot 'package.json'
-$sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw | ConvertFrom-Json
+$sourceManifest = Read-JsonFile -Path $sourceManifestPath
 if ($sourceManifest.name -ne 'dsh-phone-bridge') {
     throw 'Source must point to the dsh-phone-bridge repository root.'
 }
@@ -92,7 +108,7 @@ $profileManifestPath = Join-Path $profileDirectory 'package.json'
 if (-not (Test-Path -LiteralPath $profileManifestPath -PathType Leaf)) {
     throw 'Desktop profile package.json is missing. Start DSH once, exit it completely, then retry with its actual profile path.'
 }
-$profileManifest = Get-Content -LiteralPath $profileManifestPath -Raw | ConvertFrom-Json
+$profileManifest = Read-JsonFile -Path $profileManifestPath
 if ($profileManifest -isnot [pscustomobject]) {
     throw 'Desktop profile package.json must contain a JSON object.'
 }
@@ -141,7 +157,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Installing isolated plugin dependencies failed. Existing installed plugins were not changed.'
 }
 Assert-TreeNoReparsePoint -Path $stagedPackage
-$stagedManifest = Get-Content -LiteralPath (Join-Path $stagedPackage 'package.json') -Raw | ConvertFrom-Json
+$stagedManifest = Read-JsonFile -Path (Join-Path $stagedPackage 'package.json')
 if ($stagedManifest.name -ne 'dsh-phone-bridge' -or $stagedManifest.version -ne $sourceManifest.version) {
     throw 'Staged plugin does not match the selected source.'
 }
@@ -168,7 +184,7 @@ if (Test-Path -LiteralPath $pluginTarget) {
 }
 Copy-Item -LiteralPath $stagedPackage -Destination $pluginTarget -Recurse
 
-$profileManifest = Get-Content -LiteralPath $profileManifestPath -Raw | ConvertFrom-Json
+$profileManifest = Read-JsonFile -Path $profileManifestPath
 $dependencies = Get-JsonObject -Parent $profileManifest -Name 'dependencies'
 $dependencyPath = 'file:' + $archivePath.Replace('\', '/')
 if ($null -eq $dependencies.PSObject.Properties['dsh-phone-bridge']) {
@@ -195,7 +211,7 @@ $profileJson = $profileManifest | ConvertTo-Json -Depth 100
 [System.IO.File]::WriteAllText($profileManifestPath, $profileJson + "`n", [System.Text.UTF8Encoding]::new($false))
 
 $installedManifestPath = Join-Path $profileDirectory 'node_modules\dsh-phone-bridge\package.json'
-$installedManifest = Get-Content -LiteralPath $installedManifestPath -Raw | ConvertFrom-Json
+$installedManifest = Read-JsonFile -Path $installedManifestPath
 if ($installedManifest.name -ne 'dsh-phone-bridge' -or $installedManifest.version -ne $sourceManifest.version) {
     throw 'Installed plugin version does not match the selected source.'
 }

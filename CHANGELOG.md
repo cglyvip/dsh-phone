@@ -40,6 +40,23 @@
 - 冒烟测试增至 75 项，新增两组：代理名冲突时界面给出原因与自动重试（不卡在「正在启动」）、
   冲突自动重试用尽后提示「另一台电脑占用」。
 
+### 修复（新电脑安装脚本在中文 Windows 上跑不通）
+
+在中文 Windows（PowerShell 5.1，系统 ANSI 为 gb2312）上执行
+`.\tools\install-local.ps1` 会连续失败两次，都不是用户操作问题：
+
+- **JSON 读取乱码**：`Get-Content -Raw` 默认按系统 ANSI 解码，而仓库里的
+  `package.json` 是无 BOM 的 UTF-8，中文描述变成乱码后 `ConvertFrom-Json`
+  报「无效的 JSON 基元」。新增 `Read-JsonFile`，改用
+  `[System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)` 显式按 UTF-8 读，
+  5 处文件读取中 4 处替换（`npm pack` 的输出字符串仍按原样处理）。
+- **tar 误判路径为远程主机**：PATH 里若有 Git 自带的 GNU tar，它会把
+  `C:\Users\...` 当成 `主机:路径` 解析，报
+  `Cannot connect to C: resolve failed`。改为优先使用系统自带的 bsdtar
+  （`%SystemRoot%\System32\tar.exe`），找不到才回退 PATH 中的 `tar.exe`。
+
+两处修完，本机 3.5.1 → 3.7.1 安装成功（旧插件与 profile 均有备份）。
+
 ## 3.7.0（2026-11-17）
 
 ### 修复（电脑端发的视频手机收不到）
