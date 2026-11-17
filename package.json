@@ -35,6 +35,14 @@
   "engines": {
     "node": ">=20"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cglyvip/dsh-phone-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cglyvip/dsh-phone-bridge/issues"
+  },
+  "homepage": "https://github.com/cglyvip/dsh-phone-bridge#readme",
   "license": "MIT",
   "keywords": [
     "dsh",
