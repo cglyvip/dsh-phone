@@ -19,7 +19,7 @@ import { WebSocket } from 'ws';
 
 import { apply, normalize } from './index.js';
 import { lastChatMessage, previewOfBlocks, projectEvents, toPreviewText } from './adapter/project.js';
-import { buildFrpcConfig, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
+import { buildFrpcConfig, defaultProxyName, ensureFrpcBinary, extractFrpcFromZip, frpReleaseInfo, verifyReleaseAsset, writeFrpcConfig } from './bridge/frpc.js';
 import { ensureNgrokBinary, extractNgrokFromZip, ngrokReleaseInfo, parseNgrokLine, verifyNgrokAsset } from './bridge/ngrok.js';
 import { probePublicUrl } from './bridge/transport.js';
 import { BRIDGE_VERSION } from './shared/version.js';
@@ -1494,7 +1494,11 @@ async function main() {
     useTls: true,
     localPort: 8787,
   });
-  assert.equal(proxyName, 'dsh-phone-bridge');
+  // 代理名必须按电脑唯一化：同一台 frps 上的第二台电脑不能撞名
+  assert.ok(proxyName.startsWith('dsh-phone-bridge-'), `代理名应带本机标识，实际 ${proxyName}`);
+  assert.ok(proxyName.length <= 64, '代理名不能超过 frps 限制');
+  assert.ok(/^[a-z0-9-]+$/.test(proxyName), '代理名只允许小写字母数字与连字符');
+  assert.ok(toml.includes(`name = "${proxyName}"`));
   assert.ok(toml.includes('serverAddr = "203.0.113.10"'));
   assert.ok(toml.includes('serverPort = 7000'));
   assert.ok(toml.includes('auth.method = "token"'));
@@ -1687,9 +1691,76 @@ async function main() {
     '代理冲突重试次数用尽后报错',
   );
   assert.equal(retrySpawner.spawns.length, 3, '首次 + 2 次自动重试');
-  assert.ok(retryStatus.tunnelError.includes('另一台电脑'), `超限提示应指向另一台电脑（实际：${retryStatus.tunnelError}）`);
+  assert.ok(retryStatus.tunnelError.includes('frpc.exe'), `超限提示应指向遗留的 frpc.exe（实际：${retryStatus.tunnelError}）`);
   await transportF3.stop();
-  pass('frp 代理名冲突自动重试（用尽后提示另一台电脑占用）');
+  pass('frp 代理名冲突自动重试（用尽后提示清理遗留进程）');
+
+  // 26e) 代理名按电脑唯一化：同一台 frps 上两台电脑不能撞名，同一台电脑重启后名字必须稳定
+  const nameA = defaultProxyName('DESKTOP-AAA', 'win32');
+  const nameB = defaultProxyName('DESKTOP-BBB', 'win32');
+  const nameA2 = defaultProxyName('DESKTOP-AAA', 'win32');
+  assert.notEqual(nameA, nameB, '不同主机名必须生成不同代理名（否则第二台电脑必然 already exists）');
+  assert.equal(nameA, nameA2, '同一台电脑重启后代理名必须稳定（否则每次启动都占一个新名字）');
+  assert.ok(nameA.startsWith('dsh-phone-bridge-'), '代理名保留统一前缀便于 frps 侧识别');
+  assert.ok(/^[a-z0-9-]+$/.test(nameA), '代理名只允许小写字母数字与连字符');
+  // 主机名含空格/下划线/中文时要清洗成合法代理名
+  const messyName = defaultProxyName('我的 电脑_A', 'win32');
+  assert.ok(/^[a-z0-9-]+$/.test(messyName), `主机名含非法字符时必须清洗（实际：${messyName}）`);
+  // 显式传入的 proxyName 优先（用户想固定名字时）
+  const explicit = buildFrpcConfig({
+    serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 0, useTls: false, localPort: 8787, proxyName: 'my-fixed-name',
+  });
+  assert.equal(explicit.proxyName, 'my-fixed-name');
+  assert.ok(explicit.toml.includes('name = "my-fixed-name"'));
+  pass('frp 代理名唯一化（不同电脑不撞名 + 同机稳定 + 非法字符清洗 + 可显式指定）');
+
+  // 26f) 遗留 frpc 进程清理：DSH 被强杀后 frpc 仍占着代理名，启动前必须先清掉
+  const orphanCalls = [];
+  const killImpl = (exePath, options) => {
+    orphanCalls.push({ exePath, hasLog: typeof options?.log === 'function' });
+    return 1;
+  };
+  const orphanSpawner = makeFrpcSpawner({
+    lines: ['2026/11/17 22:54:36 [I] [client/service] login to server success, get run id [aaa111]',
+      '2026/11/17 22:54:37 [I] [client/control] [aaa111] [probe] start proxy success'],
+    exitAfterMs: -1,
+  });
+  const transportF4 = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 27000, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: orphanSpawner.spawnImpl,
+    killImpl,
+    backoffBaseMs: 20,
+  });
+  await transportF4.start({ localPort: 8787 });
+  assert.equal(orphanCalls.length, 1, '启动前必须清理一次遗留 frpc 进程');
+  assert.ok(orphanCalls[0].exePath.endsWith('frpc.exe'), `清理目标应是本机托管的 frpc.exe（实际：${orphanCalls[0].exePath}）`);
+  assert.ok(orphanCalls[0].hasLog, '清理应能记录日志');
+  assert.equal(orphanSpawner.spawns.length, 1, '清理后照常拉起新进程');
+  await transportF4.stop();
+
+  // 清理失败不能挡住启动（尽力而为）
+  const transportF5 = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 27000, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: makeFrpcSpawner({ lines: [], exitAfterMs: -1 }).spawnImpl,
+    killImpl: () => {
+      throw new Error('taskkill 失败');
+    },
+    backoffBaseMs: 20,
+  });
+  await transportF5.start({ localPort: 8787 });
+  assert.equal(transportF5.status().tunnelStatus, 'starting', '清理抛错时仍应正常拉起 frpc');
+  await transportF5.stop();
+  pass('frp 遗留进程清理（启动前清理 + 清理失败不挡启动）');
 
   // 27) v3.2 §10：通道统一状态机切换（停旧起新 + 持久化 + 失败降级）
   let quickStopped = 0;

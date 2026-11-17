@@ -1,5 +1,64 @@
 ﻿# CHANGELOG
 
+## 3.7.2（2026-11-17）
+
+### 修复（同一台 frps 上的第二台电脑永远连不上）
+
+现象：手机连**另一台电脑**上的 DSH，App 一直报「请求超时，请检查网络与桌面端是否在线」，
+配对页的 frp 通道停在「正在启动」。
+
+排查结论：frps（`144.24.55.61:7000`）可达、token 正确、`remotePort=27000` 也空闲——
+用**随机代理名**做探针能在 27000 上成功注册；但用原来的固定代理名连，连续 2 分钟
+（每 25 秒一次，共 5 次）始终返回
+`start error: proxy [dsh-phone-bridge] already exists`，而 27000 端口全程没有监听。
+说明占用代理名的是一个**活着的 frpc**，不是等心跳超时的僵尸连接。
+
+两个根因：
+
+- **代理名写死**（`bridge/frpc.js`）：`buildFrpcConfig()` 把 `name` 固定成
+  `dsh-phone-bridge`，而 frps 上代理名是**全局唯一**的。于是同一台 frps 上的第二台电脑
+  必然撞名，且撞名后 frpc 进程不退出、不重试，界面就一直停在「正在启动」。
+- **遗留进程无人清理**（`bridge/transport.js`）：DSH 被强杀、崩溃或托盘未正常退出时，
+  Windows 上已 spawn 的 `frpc.exe` 不会跟着退出，继续占着代理名与 `remotePort`。
+  原代码里没有任何清理逻辑，用户也很难想到是本地残留进程。
+
+### 新增（代理名按本机唯一化）
+
+- 新增 `defaultProxyName(hostname, platform)`，生成
+  `dsh-phone-bridge-<主机名slug>-<sha256前8位>`（如
+  `dsh-phone-bridge-desktop-8o5efju-88ce510f`）。不同电脑互不干扰；同一台电脑重启后
+  名字稳定，不会每次启动都占一个新名字。主机名里的空格、下划线、中文会被清洗成
+  `[a-z0-9-]`。手机连的是 `公网IP:remotePort`，与代理名无关，**改名不影响已有配对**。
+- `buildFrpcConfig()` 支持 `cfg.proxyName` 显式指定，想固定名字时可用。
+- 实测：用新代理名 + 原参数（27000 端口）连 frps，`login to server success` 后紧跟
+  `start proxy success`，端口注册成功。
+
+### 新增（启动前清理遗留 frpc）
+
+- 新增 `killOrphanFrpc(exePath)`：Windows 上用
+  `Get-CimInstance Win32_Process` + `Stop-Process -Force`，**只杀可执行文件路径与本机
+  托管的那份 `frpc.exe` 完全相同**的进程，不会误伤用户自己另外跑的 frpc。
+  路径两侧都用 `[System.IO.Path]::GetFullPath()` 规范化——`Win32_Process` 返回反斜杠，
+  而 Node 的 `path.join` 返回正斜杠，直接字符串比较永远不相等（调试时踩过这个坑）。
+- `FrpChannel.start()` 在 spawn 前调用它；清理是**尽力而为**，找不到进程、命令失败、
+  超时都静默跳过，绝不挡住正常启动。
+- `killImpl` 可注入，冒烟测试用假实现，不会真的去杀系统进程。
+
+### 改动
+
+- 冲突重试用尽后的提示改写：不再说「另一台电脑仍在运行同一份配置」（代理名已唯一化，
+  这个说法不再准确），改为指向本机遗留的 `frpc.exe`，并提示 `remotePort` 被别的电脑
+  占用时换端口。
+
+### 测试
+
+- 冒烟测试增至 77 项，新增两组：
+  - **代理名唯一化**：不同主机名生成不同代理名、同机重启名字稳定、非法字符清洗、
+    显式 `proxyName` 优先。
+  - **遗留进程清理**：启动前必须清理一次、清理目标指向本机 `frpc.exe`、
+    清理抛错时仍照常拉起 frpc。
+- `node --test tools/*.mjs`：29 项全通过。
+
 ## 3.7.1（2026-11-17）
 
 ### 修复（frp 一直连不上电脑）

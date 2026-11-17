@@ -21,6 +21,7 @@ import {
   buildFrpcConfig,
   ensureFrpcBinary,
   frpcHomeDir,
+  killOrphanFrpc,
   parseFrpcLine,
   writeFrpcConfig,
 } from './frpc.js';
@@ -147,6 +148,8 @@ class FrpChannel {
     this.child = null;
     this.exePath = '';
     this.configPath = '';
+    // 孤儿进程清理可注入（smoke-test 不真的去杀系统进程）
+    this.killImpl = typeof options.killImpl === 'function' ? options.killImpl : killOrphanFrpc;
     this.stopping = false;
     this.restarts = 0;
     this.conflictRetries = 0;
@@ -172,7 +175,19 @@ class FrpChannel {
     this.binary = source;
 
     if (this.stopping) return;
+    // DSH 上次被强杀时 frpc 可能还活着，继续占着代理名与端口——先清掉再起新的
+    this.killOrphans();
     this.spawnFrpc();
+  }
+
+  /** 清理上一次遗留的 frpc 进程（可注入 killImpl，smoke-test 用假实现）。 */
+  killOrphans() {
+    try {
+      return this.killImpl(this.exePath, { log: this.log });
+    } catch {
+      // 清理是尽力而为，失败不影响启动
+      return 0;
+    }
   }
 
   /**
@@ -240,8 +255,9 @@ class FrpChannel {
           status: 'error',
           url: '',
           error: `frpc 代理名/端口持续被占用：${reason}。`
-            + '通常是另一台电脑仍在运行同一 frp 配置——请先在那台电脑停止该通道，'
-            + '或把本机的 remotePort 改成别的端口后重试',
+            + '如果本机之前异常退出过，可能是遗留的 frpc.exe 还占着——'
+            + '在任务管理器结束 frpc.exe 后重启 DSH；'
+            + '若 remotePort 被别的电脑占用，把它改成别的端口后重试',
         };
         return;
       }
@@ -352,6 +368,7 @@ export class TransportManager {
    *   backoffBaseMs?: number,
    *   conflictRetryBaseMs?: number,
    *   maxConflictRetries?: number,
+   *   killImpl?: (exePath: string, options?: object) => number,
    * }} deps
    */
   constructor(deps) {
@@ -366,6 +383,7 @@ export class TransportManager {
     this.backoffBaseMs = deps.backoffBaseMs;
     this.conflictRetryBaseMs = deps.conflictRetryBaseMs;
     this.maxConflictRetries = deps.maxConflictRetries;
+    this.killImpl = deps.killImpl;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.localPort = 0;
     this.switching = false;
@@ -521,6 +539,7 @@ export class TransportManager {
       ...(this.backoffBaseMs !== undefined ? { backoffBaseMs: this.backoffBaseMs } : {}),
       ...(this.conflictRetryBaseMs !== undefined ? { conflictRetryBaseMs: this.conflictRetryBaseMs } : {}),
       ...(this.maxConflictRetries !== undefined ? { maxConflictRetries: this.maxConflictRetries } : {}),
+      ...(this.killImpl !== undefined ? { killImpl: this.killImpl } : {}),
     });
     this.channel = channel;
     try {

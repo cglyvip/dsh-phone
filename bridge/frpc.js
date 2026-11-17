@@ -17,8 +17,10 @@
  *
  * token 只写入 frpc.toml（权限 600）与内存；永不进日志 / 状态 / 健康检查。
  */
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
@@ -40,11 +42,44 @@ export function frpReleaseInfo(version = FRP_VERSION) {
   };
 }
 
+/** frps 上代理名的统一前缀（便于在 frps 日志里认出本插件）。 */
+export const PROXY_NAME_PREFIX = 'dsh-phone-bridge';
+
+/**
+ * 生成这台电脑专用的 frp 代理名。
+ *
+ * frps 上同一个代理名只允许一个连接占用。早期版本把名字写死成
+ * `dsh-phone-bridge`，于是**同一台 frps 上的第二台电脑必然注册失败**
+ * （`start error: proxy [dsh-phone-bridge] already exists`），
+ * 表现为配对页一直「正在启动」、手机端请求超时。
+ *
+ * 现在按主机名 + 主机名/平台哈希生成唯一名：不同电脑互不干扰，
+ * 同一台电脑重启后名字稳定（不会每次都占一个新名字）。
+ * 手机连的是 `VPS:remotePort`，与代理名无关，改名不影响已有配对。
+ *
+ * @param {string} [hostname] 可注入（测试用），默认取本机主机名
+ * @param {string} [platform] 可注入（测试用），默认取本机平台
+ * @returns {string} 形如 `dsh-phone-bridge-desktop-a1b2c3d4`
+ */
+export function defaultProxyName(hostname, platform) {
+  const rawHost = typeof hostname === 'string' && hostname.length > 0
+    ? hostname
+    : os.hostname();
+  const rawPlatform = typeof platform === 'string' && platform.length > 0
+    ? platform
+    : os.platform();
+  // 代理名只保留字母数字与连字符：主机名里的空格、下划线、中文都要清掉
+  const slug = rawHost.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+  const digest = crypto.createHash('sha256').update(`${rawHost}|${rawPlatform}`).digest('hex').slice(0, 8);
+  return `${PROXY_NAME_PREFIX}-${slug.length > 0 ? slug : 'pc'}-${digest}`;
+}
+
 /**
  * 生成 frpc.toml 内容。
  * @param {{
  *   serverAddr: string, serverPort: number, token: string,
  *   remotePort: number, useTls: boolean, localPort: number,
+ *   proxyName?: string,
  * }} cfg frp 通道配置（token 必填——公网暴露必须鉴权）
  * @returns {{ toml: string, proxyName: string }}
  */
@@ -55,7 +90,10 @@ export function buildFrpcConfig(cfg) {
   const remotePort = Number.isInteger(cfg.remotePort) ? cfg.remotePort : 0;
   const useTls = cfg.useTls === true;
   const localPort = Number.isInteger(cfg.localPort) ? cfg.localPort : 0;
-  const proxyName = 'dsh-phone-bridge';
+  // 默认按本机唯一化，避免同一台 frps 上的多台电脑撞名
+  const proxyName = typeof cfg.proxyName === 'string' && cfg.proxyName.trim().length > 0
+    ? cfg.proxyName.trim()
+    : defaultProxyName();
 
   if (serverAddr.length === 0) {
     throw new Error('frp 通道缺少 serverAddr（VPS 地址）');
@@ -337,6 +375,58 @@ async function defaultFetchBuffer(url) {
 /** frpc 工作目录：$DSH_HOME/phone-bridge/frpc。 */
 export function frpcHomeDir(home) {
   return path.join(home, 'phone-bridge', 'frpc');
+}
+
+/**
+ * 清理上一次运行遗留的 frpc 进程。
+ *
+ * DSH 被强杀、崩溃或托盘未正常退出时，Windows 上已经 spawn 的 frpc.exe 不会跟着退出。
+ * 它会继续连着 frps、占着代理名和 remotePort——新启动的 frpc 于是报
+ * `proxy [...] already exists`，而用户根本没开别的电脑，很难想到是本地残留进程。
+ *
+ * 只杀**可执行文件路径与本机托管的那份 frpc.exe 完全相同**的进程，
+ * 不会碰到用户自己另外跑的 frpc。找不到进程或命令失败都静默跳过：
+ * 清理是尽力而为，不能因为它挡住正常启动。
+ *
+ * @param {string} exePath 本机托管 frpc.exe 的绝对路径
+ * @param {{ execImpl?: Function, log?: (msg: string) => void }} [options]
+ * @returns {number} 被杀掉的进程数（拿不到结果时为 0）
+ */
+export function killOrphanFrpc(exePath, options = {}) {
+  const log = typeof options.log === 'function' ? options.log : () => {};
+  const execImpl = typeof options.execImpl === 'function' ? options.execImpl : execFileSync;
+  if (typeof exePath !== 'string' || exePath.length === 0) return 0;
+
+  let killed = 0;
+  try {
+    if (process.platform === 'win32') {
+      // 用环境变量传路径，避免把反斜杠/引号拼进 PowerShell 命令里出错
+      // 两侧都必须先规范化：Win32_Process 返回的是反斜杠路径，而调用方可能传正斜杠
+      const script = [
+        "$target = [System.IO.Path]::GetFullPath($env:DSH_FRPC_TARGET)",
+        "$procs = Get-CimInstance Win32_Process -Filter \"Name='frpc.exe'\" -ErrorAction SilentlyContinue",
+        "$hit = @($procs | Where-Object { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) })",
+        "foreach ($p in $hit) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} }",
+        "$hit.Count",
+      ].join('; ');
+      const output = execImpl(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        { env: { ...process.env, DSH_FRPC_TARGET: exePath }, encoding: 'utf8', timeout: 15000, windowsHide: true },
+      );
+      killed = Number.parseInt(String(output).trim(), 10);
+      if (!Number.isInteger(killed) || killed < 0) killed = 0;
+    } else {
+      // 非 Windows：按命令行精确匹配可执行文件路径
+      execImpl('pkill', ['-f', `^${exePath}( |$)`], { timeout: 15000 });
+      killed = 1;
+    }
+  } catch {
+    // pkill 没有匹配到进程会返回非 0；PowerShell 查询失败也一样——都不影响启动
+    return 0;
+  }
+  if (killed > 0) log(`已清理上一次遗留的 frpc 进程（${killed} 个），避免代理名被继续占用`);
+  return killed;
 }
 
 /** 写 frpc.toml（同目录、权限 600）。 */
