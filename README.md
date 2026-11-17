@@ -14,12 +14,12 @@ DeepSeek Harness 的手机端桥接插件。跑在 DSH 桌面客户端进程内�
 > **核心红线**：发消息只走 `sessionController.prompt()`，进入 DSH 的 Agent 循环。
 > 插件从不直连模型 API，也不会绕过 harness 的工具/审批机制。
 
-配套的手机端：
+配套的手机端（两个客户端仓库目前未公开，仅作项目结构说明）：
 
 | 仓库 | 平台 |
 |---|---|
-| [dsh-harmony](https://github.com/cglyvip/dsh-harmony) | 鸿蒙（ArkTS / ArkUI） |
-| [dsh-android](https://github.com/cglyvip/dsh-android) | 安卓（Kotlin / Compose） |
+| `dsh-harmony` | 鸿蒙（ArkTS / ArkUI） |
+| `dsh-android` | 安卓（Kotlin / Compose） |
 
 ---
 
@@ -61,10 +61,10 @@ Set-Location .\dsh-phone-bridge
 .\tools\install-local.ps1
 ```
 
-仓库是私有仓库，克隆时需要有访问权限的 GitHub 账号。下载代码不等于已经安装插件，
-必须执行安装脚本。脚本使用 `npm pack` 的发布文件白名单打包，在独立临时目录用 `npm install`
-安装运行依赖，再只替换 `node_modules/dsh-phone-bridge`。依赖保留在插件自己的 `node_modules`
-中，不在整个 desktop profile 上运行 npm，不改动 DSH 自带组件或其他插件目录。
+下载代码不等于已经安装插件，必须执行安装脚本。脚本使用 `npm pack` 的发布文件白名单打包，
+在独立临时目录用 `npm install` 安装运行依赖，再只替换 `node_modules/dsh-phone-bridge`。
+依赖保留在插件自己的 `node_modules` 中，不在整个 desktop profile 上运行 npm，
+不改动 DSH 自带组件或其他插件目录。
 
 默认 desktop profile 位于 `$env:DSH_HOME\profiles\desktop`；没有设置 `DSH_HOME` 时使用
 `$env:USERPROFILE\.dsh\profiles\desktop`。如果 DSH 使用自定义目录，显式指定：
@@ -287,9 +287,9 @@ cd dsh-phone-bridge
 node smoke-test.mjs
 ```
 
-`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 71 项
+`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 73 项
 （REST 全部路由 + 鉴权 + 配对码一次性 + 按 turn 分页 + WS 握手/推送/过滤/增量/补拉
-+ 六种公网通道切换与参数落盘）。
++ 六种公网通道切换与参数落盘 + `/api/media` 会话内媒体转出）。
 
 专项回归：
 
@@ -306,3 +306,10 @@ node --test tools/test-cloudflare-startup.mjs tools/test-transport-startup.mjs t
 - v3.5.0：六种公网通道 + 配对页可视化切换
 - v3.5.1：配对页补齐 frp 参数表单，换电脑不必手改 YAML
 - v3.6.0：14 项穿透服务目录、严格地址验证、本机通道控制和新电脑安装流程
+- v3.7.0：会话内媒体转出，电脑端交付的视频手机能收到（`media:v1.` 绝对路径 + 白名单校验）
+
+---
+
+## 许可
+
+[MIT](LICENSE)

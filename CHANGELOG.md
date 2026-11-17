@@ -1,5 +1,46 @@
 ﻿# CHANGELOG
 
+## 3.7.0（2026-11-17）
+
+### 修复（电脑端发的视频手机收不到）
+
+现象：远程电脑在会话里交付的视频（例如 `D:\work\deliver\demo.mp4`），
+手机端既没有视频块，点开也是 404。经排查是四处叠加导致，逐层修复：
+
+- **投影层只认 JSON**（`adapter/project.js`）：`extractMediaBlocks()` 原本只解析
+  工具输出的 `{"videos":[...]}` 结构。实际交付走的是 `present` 工具的
+  `Presented D:\...\demo.mp4` 行和 markdown 表格里的
+  `[demo](<deliver/demo.mp4>)`，两种都提取不到。现在三种形状全认，
+  相对路径按会话 `cwd` 展开成绝对路径，非媒体扩展名不转块，按 `类型|id` 去重。
+- **正文残留本机路径**（`stripLocalMediaPaths()`）：原来只清 `![alt](路径)`，
+  `[文字](路径)` 原样留在气泡里。现在图片语法整段删除、链接降级为纯文字、
+  `Presented <路径>` 行降级为文件名，并折叠多余空行。
+- **取字节被硬限制在生图目录**（`adapter/dsh.js`）：`mediaFilePath()` 原来只接受
+  `$DSH_HOME/dsh-imagegen/videos/files` 下的纯文件名，任意工作区路径必然 404。
+  新增 ID 形态 `media:v1.<base64url(绝对路径)>`；服务端解码后要求路径绝对、
+  扩展名属于图片/视频白名单、`realpath` 后仍落在白名单根内
+  （`$DSH_HOME/dsh-imagegen` + 全部会话 cwd 含归档 + 全部工作区路径），
+  否则一律 404，不区分「不存在」与「越权」。非媒体扩展名 400，相对路径 400。
+  白名单缓存 60 秒。
+- **媒体块挂在 tool 消息上**（手机端不渲染）：`promoteToAssistant()` 把工具结果里的
+  媒体块复制到同一 turn 的助手消息，鸿蒙端无需改动即可显示。
+
+### 兼容
+
+- `media:` 前缀沿用旧约定，鸿蒙 `mediaSrcOf()` 剥前缀后的 `v1.<base64url>` 形态桥端同样接受，
+  老版本 App 不用升级。
+- `cwd` 现在随 `session/event`、`GET /api/sessions/:id`、历史分页一路透传，
+  相对路径才有展开依据。
+- 契约版本仍为 `3`，`CONTRACT_VERSION` / `MIN_CONTRACT_VERSION` 未变。
+
+### 测试
+
+- 冒烟测试增至 73 项，新增两组：
+  - `/api/media` v1：工作区视频 200 + 字节一致、剥前缀形态、Range 206、
+    白名单外 404、路径穿越 404、非媒体 400、相对路径 400、不存在 404。
+  - 非 JSON 交付投影：`Presented` 行与 markdown 相对路径都抽出 `video` 块、
+    助手消息同样带块、无 cwd 时不臆造、`http(s)` 外链不转块。
+
 ## 3.6.0（2026-11-17）
 
 - 新增 14 项穿透服务接入目录，区分标准 frps、桥托管通道和服务商官方客户端，提供官方文档、免费条件及基于实际端口的步骤。

@@ -779,6 +779,80 @@ async function main() {
   else process.env.DSH_HOME = previousMediaHome;
   pass('GET /api/media/:name 二进制视频');
 
+  // 17b2) v3.7：会话工作区里的媒体（media:v1.<base64url(绝对路径)>）
+  // 远程会话把视频交付到工作区（`deliver/demo.mp4`），既不在 dsh-imagegen 目录下、
+  // 也不是纯文件名 —— 老的白名单写法永远转不出字节，这正是「手机收不到视频」的直接原因。
+  const localMediaHome = mkdtempSync(join(tmpdir(), 'dsh-bridge-local-media-'));
+  const previousLocalMediaHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = localMediaHome;
+  // 白名单根之一是 $DSH_HOME/dsh-imagegen，先建出来（真实环境由生图插件落盘）
+  mkdirSync(join(localMediaHome, 'dsh-imagegen'), { recursive: true });
+  // 另一个白名单根：临时目录冒充「远程电脑上的会话工作区」
+  const workspaceDir = mkdtempSync(join(tmpdir(), 'dsh-bridge-workspace-'));
+  const originalWorkspaceList = ctx.__services.workspaceRegistry.list;
+  ctx.__services.workspaceRegistry.list = async () => [
+    { workspaceId: 'w-work', path: workspaceDir, title: '交付' },
+  ];
+  const deliveredDir = join(workspaceDir, 'deliver');
+  mkdirSync(deliveredDir, { recursive: true });
+  const deliveredFile = join(deliveredDir, 'demo.mp4');
+  writeFileSync(deliveredFile, mediaBytes);
+  /** 与 adapter/project.js 的 encodeLocalMediaId 保持同一约定：media:v1.<base64url> */
+  const encodeMediaId = (absolute) => `media:v1.${Buffer.from(absolute, 'utf8').toString('base64url')}`;
+  const deliveredId = encodeMediaId(deliveredFile);
+  const mediaUrlOf = (id) => `http://127.0.0.1:${port}/api/media/${encodeURIComponent(id)}?token=${encodeURIComponent(paired.json.token)}`;
+
+  const deliveredResponse = await fetch(mediaUrlOf(deliveredId));
+  const deliveredBody = Buffer.from(await deliveredResponse.arrayBuffer());
+  assert.equal(deliveredResponse.status, 200, '工作区内的视频应返回 200');
+  assert.equal(deliveredResponse.headers.get('content-type'), 'video/mp4', '工作区视频 Content-Type 应为 video/mp4');
+  assert.ok(deliveredBody.equals(mediaBytes), '工作区视频字节应一致');
+
+  // 鸿蒙 1.0.x 的 ApiClient.mediaSrcOf 会剥掉 `media:` 前缀，桥实际收到 `v1.<base64url>`
+  const strippedResponse = await fetch(mediaUrlOf(deliveredId.slice('media:'.length)));
+  assert.equal(strippedResponse.status, 200, '剥掉 media: 前缀的 v1 形态也应可用');
+  assert.ok(Buffer.from(await strippedResponse.arrayBuffer()).equals(mediaBytes), '剥前缀形态字节应一致');
+
+  const deliveredRange = await fetch(mediaUrlOf(deliveredId), { headers: { Range: 'bytes=2-5' } });
+  const deliveredRangeBody = Buffer.from(await deliveredRange.arrayBuffer());
+  assert.equal(deliveredRange.status, 206, '工作区视频的 Range 请求应返回 206');
+  assert.ok(deliveredRangeBody.equals(mediaBytes.subarray(2, 6)), 'Range 字节应与源文件一致');
+
+  // 白名单外：路径本身合法，但不是任何会话工作区 / 生成目录 → 404，不透露存在性
+  const outsideDir = mkdtempSync(join(tmpdir(), 'dsh-bridge-outside-'));
+  const outsideFile = join(outsideDir, 'secret.mp4');
+  writeFileSync(outsideFile, mediaBytes);
+  const outsideResponse = await request(port, 'GET', `/api/media/${encodeURIComponent(encodeMediaId(outsideFile))}`, { token });
+  assert.equal(outsideResponse.status, 404, '白名单外的媒体应返回 404');
+  assert.equal(outsideResponse.json.error.code, 'MEDIA_NOT_FOUND', '白名单外的媒体应报 MEDIA_NOT_FOUND');
+  // 穿越写法同样出不去（realpath 归一化后仍在白名单外）
+  const outsideName = outsideDir.split(/[\\/]/).pop();
+  const traversalId = encodeMediaId(`${workspaceDir}/../${outsideName}/secret.mp4`);
+  const traversalResponse = await request(port, 'GET', `/api/media/${encodeURIComponent(traversalId)}`, { token });
+  assert.equal(traversalResponse.json.error.code, 'MEDIA_NOT_FOUND', '白名单内起手的穿越路径仍应被拒');
+
+  // 非媒体扩展名：防止把密钥/配置文件当媒体转出
+  const textFile = join(workspaceDir, 'notes.txt');
+  writeFileSync(textFile, 'not media');
+  const textResponse = await request(port, 'GET', `/api/media/${encodeURIComponent(encodeMediaId(textFile))}`, { token });
+  assert.equal(textResponse.status, 400, '非媒体扩展名应返回 400');
+  assert.equal(textResponse.json.error.code, 'INVALID_PARAM', '非媒体扩展名应报 INVALID_PARAM');
+
+  // 相对路径：v1 只接受绝对路径（相对路径必须由投影层按 cwd 展开）
+  const relativeId = `media:v1.${Buffer.from('deliver/demo.mp4', 'utf8').toString('base64url')}`;
+  const relativeResponse = await request(port, 'GET', `/api/media/${encodeURIComponent(relativeId)}`, { token });
+  assert.equal(relativeResponse.status, 400, 'v1 相对路径应返回 400');
+  assert.equal(relativeResponse.json.error.code, 'INVALID_PARAM', 'v1 相对路径应报 INVALID_PARAM');
+
+  // 文件不存在：404
+  const missingLocal = await request(port, 'GET', `/api/media/${encodeURIComponent(encodeMediaId(join(workspaceDir, 'nope.mp4')))}`, { token });
+  assert.equal(missingLocal.json.error.code, 'MEDIA_NOT_FOUND', '不存在的本地媒体应报 MEDIA_NOT_FOUND');
+
+  ctx.__services.workspaceRegistry.list = originalWorkspaceList;
+  if (previousLocalMediaHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousLocalMediaHome;
+  pass('GET /api/media v1（工作区视频 / 剥前缀形态 / Range / 越权 404 / 非媒体 400）');
+
   // 17c) 通用文件附件（file 块）二进制响应
   const fileBytes = Buffer.from('DSH-FILE-ATTACHMENT-PAYLOAD', 'utf8');
   const fileHex = crypto.createHash('sha256').update(fileBytes).digest('hex');
@@ -865,6 +939,97 @@ async function main() {
   assert.equal(assistant.text.includes('C:\\Users'), false, '助手正文不应带本机路径');
   assert.ok(assistant.text.includes('生成完成'), '助手正文其余内容应保留');
   pass('生成类工具媒体投影（图片/视频块 + 剥离本机路径）');
+
+  // 17e) v3.7：非 JSON 交付形态（present 工具 + 助手正文 markdown）+ 媒体块提升
+  // 实测远程会话：视频由 present 工具逐行 `Presented <绝对路径>` 交付，
+  // 助手正文用 markdown 表格链接 `[demo](<deliver/demo.mp4>)` 给出相对路径。
+  // 老实现只认 JSON，两条路径都抽不出媒体块 —— 手机端因此什么都收不到。
+  const remoteCwd = 'D:\\work';
+  const presentedPath = `${remoteCwd}\\deliver\\demo.mp4`;
+  const relativeTarget = 'deliver/demo.mp4';
+  const expectedAbsolute = 'D:\\work\\deliver\\demo.mp4';
+  const expectedVideoId = `media:v1.${Buffer.from(expectedAbsolute, 'utf8').toString('base64url')}`;
+  const delivered = projectEvents([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'tool/result',
+      seq: 2,
+      time: 2,
+      data: {
+        turn: 1,
+        step: 1,
+        callId: 'c1',
+        message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: `Presented ${presentedPath}` }] },
+      },
+    },
+    {
+      type: 'assistant/message',
+      seq: 3,
+      time: 3,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: `今日交付：\n\n| 视频 | 时长 |\n| --- | --- |\n| [demo](<${relativeTarget}>) | 30s |` }],
+        },
+      },
+    },
+    { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'stop' } } },
+  ], { cwd: remoteCwd });
+
+  const presentedTool = delivered.messages.find((m) => m.seq === 2);
+  const presentedBlock = presentedTool.blocks.find((b) => b.type === 'video');
+  assert.ok(presentedBlock !== undefined, 'present 工具结果应抽成 video 块');
+  assert.equal(presentedBlock.attachmentId, expectedVideoId, 'Presented 绝对路径应编码成 media:v1.<base64url>');
+  assert.equal(presentedBlock.name, 'demo.mp4', '媒体块应带可读文件名');
+  assert.equal(presentedBlock.mediaType, 'video/mp4');
+  assert.equal(presentedTool.text.includes('Presented'), false, 'Presented 行应降级为文件名，不再暴露路径');
+  assert.equal(presentedTool.text, 'demo.mp4', 'Presented 行只留文件名');
+
+  const deliveredAssistant = delivered.messages.find((m) => m.seq === 3);
+  const markdownBlock = deliveredAssistant.blocks.find((b) => b.type === 'video');
+  assert.ok(markdownBlock !== undefined, '助手正文的 markdown 链接应抽成 video 块');
+  assert.equal(markdownBlock.attachmentId, expectedVideoId, '相对路径应按 cwd 展开后编码');
+  assert.equal(deliveredAssistant.text.includes('deliver/'), false, '正文里的媒体路径应降级为链接文字');
+  assert.ok(deliveredAssistant.text.includes('demo'), '正文应保留可读的链接文字');
+  assert.ok(deliveredAssistant.text.includes('30s'), '正文表格其余内容应保留');
+  // 工具行的媒体块要提升到同 turn 的助手消息上：鸿蒙端工具行不渲染 blocks
+  assert.ok(
+    deliveredAssistant.blocks.some((b) => b.type === 'video' && b.attachmentId === expectedVideoId),
+    '媒体块应同时挂在同 turn 助手消息上（手机端工具行不渲染 blocks）',
+  );
+
+  // 拿不到 cwd 时不得瞎猜相对路径（宁可不给）
+  const noCwd = projectEvents([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'assistant/message',
+      seq: 2,
+      time: 2,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `[E9](${relativeTarget})` }] } },
+    },
+  ]);
+  const noCwdAssistant = noCwd.messages.find((m) => m.seq === 2);
+  assert.equal(
+    noCwdAssistant.blocks.some((b) => b.type === 'video'),
+    false,
+    '没有 cwd 时相对路径不应臆造成媒体块',
+  );
+  // 外链不能被当成本机媒体
+  const external = projectEvents([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'assistant/message',
+      seq: 2,
+      time: 2,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '[示例](https://example.com/a.mp4)' }] } },
+    },
+  ], { cwd: remoteCwd });
+  const externalAssistant = external.messages.find((m) => m.seq === 2);
+  assert.equal(externalAssistant.blocks.some((b) => b.type === 'video'), false, 'http(s) 外链不应变成媒体块');
+  assert.ok(externalAssistant.text.includes('https://example.com/a.mp4'), '外链正文应原样保留');
+  pass('非 JSON 交付投影（Presented 行 / markdown 相对路径 / 提升到助手消息 / 无 cwd 不外推）');
 
   // 18) v3.1：POST /api/uploads 上传（幂等 / 尺寸解析 / 超限 413）
   const uploadHome = mkdtempSync(join(tmpdir(), 'dsh-bridge-upload-'));

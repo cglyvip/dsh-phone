@@ -4,9 +4,30 @@
 > 类型定义见同目录 `types.ts`；鸿蒙端的镜像类型在
 > `DSH-hm/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
 
-- 桥版本：`3.6.0`
+- 桥版本：`3.7.0`
 - 契约版本：`3`（`MIN_CONTRACT_VERSION = 3`）
 - 协议名：`dsh-phone-bridge`
+
+### 3.7.0 会话内媒体转出（详见 §3.3）
+
+v3.6 及以前，只有生视频工具落在 `$DSH_HOME/dsh-imagegen/videos/files` 的文件能转成
+`video` 块，其他任何路径（例如电脑端在会话工作区里交付的
+`D:\work\deliver\demo.mp4`）都会被丢弃，手机端因此收不到视频。v3.7 打通三层：
+
+1. **投影层**（`adapter/project.js`）：除了原有的 JSON 形状，还识别两种常见交付写法——
+   markdown 链接 `[标题](<相对/绝对路径>)` 与工具输出里的 `Presented <路径>` 行。
+   相对路径按会话 `cwd` 展开成绝对路径；非媒体扩展名不转块。
+   正文里的本机路径会被降级（图片语法整段删除、链接降级为纯文字、`Presented` 行降级为文件名），
+   避免手机端出现 `D:\...` 这类无意义文本。
+2. **块提升**：工具结果里的媒体块会复制一份到同一 turn 的助手消息上，
+   老客户端（鸿蒙 1.0.x）无需改动即可渲染。
+3. **取字节**（`GET /api/media/:id`）：新增 ID 形态 `media:v1.<base64url(绝对路径)>`。
+   服务端解码后要求路径绝对、扩展名属于图片/视频白名单、`realpath` 后仍落在白名单根内
+   （`$DSH_HOME/dsh-imagegen` + 全部会话 cwd 含归档 + 全部工作区路径），否则一律
+   `404 MEDIA_NOT_FOUND`（不区分「不存在」与「越权」）。非媒体扩展名 `400 INVALID_PARAM`。
+
+`media:` 前缀沿用旧约定，客户端 `mediaSrcOf()` 剥掉前缀后桥端同样接受 `v1.` 形态，
+因此老版本 App 不需要升级。契约版本仍为 `3`，属纯增量。
 
 ### 3.6.0 公网接入补充
 
@@ -177,6 +198,29 @@ Content-Type: application/json
 
 模型目录**完全来自** `sessionController.modelCatalog()`，桥不做任何硬编码回退。
 
+### 3.3 媒体与附件字节
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/attachments/:id` | 图片附件字节（`sha256:<64hex>`），支持 Range |
+| GET | `/api/files/:id` | 通用文件附件字节（`sha256:<64hex>`） |
+| GET | `/api/media/:id` | 媒体字节，支持 Range（v3.7，见下） |
+
+`/api/media/:id` 接受四种 `id`（URL 编码后放进路径，带 `?token=`）：
+
+| 形态 | 指向 |
+|---|---|
+| `<文件名>.mp4` | `$DSH_HOME/dsh-imagegen/videos/files/<文件名>`（v3.0 生视频，禁止目录层级） |
+| `media:<文件名>` | 同上，兼容老客户端的原样透传 |
+| `media:v1.<base64url>` | base64url 解码出的**绝对路径**，须落在白名单根内（v3.7） |
+| `v1.<base64url>` | 同上，兼容剥掉 `media:` 前缀的客户端（鸿蒙 `mediaSrcOf()` 即如此） |
+
+白名单根 = `$DSH_HOME/dsh-imagegen` + 全部会话 `cwd`（含归档）+ 全部工作区路径，
+逐个 `realpath` 归一化后按前缀比对（大小写不敏感、补路径分隔符）。判定顺序：
+空 id → `400`；非图片/视频扩展名 → `400 INVALID_PARAM`；相对路径 → `400`；
+`realpath` 失败 / 非普通文件 / 不在白名单内 → `404 MEDIA_NOT_FOUND`。
+成功响应带 `Cache-Control: private, max-age=86400` 与正确的 `Content-Type`。
+
 ---
 
 ## 4. WebSocket 数据面
@@ -256,7 +300,7 @@ Content-Type: application/json
 | `ROUTE_LOCAL_ONLY` | 403 | 仅限本机的接口被隧道/远程流量触碰（v3.1 安全修复：配对码绝不经隧道下发） | 走 App 配对流程（配对码在电脑上读） |
 | `SESSION_NOT_FOUND` | 404 | 会话不存在 | 返回列表并刷新 |
 | `ATTACHMENT_NOT_FOUND` | 404 | 附件对象不存在（v3.1：GET /api/attachments/:id、/api/files/:id） | 提示资源已失效 |
-| `MEDIA_NOT_FOUND` | 404 | 媒体文件不存在（v3.1：GET /api/media/:name） | 提示资源已失效 |
+| `MEDIA_NOT_FOUND` | 404 | 媒体文件不存在或不在白名单内（v3.1：GET /api/media/:name；v3.7 增 `media:v1.<base64url>` 绝对路径形态，越权同样按 404 处理） | 提示资源已失效 |
 | `NOT_SUPPORTED` | 501 | 当前 DSH 版本不支持该能力 | 隐藏对应按钮 |
 | `INVALID_PARAM` | 400 | 参数不合法 | 提示并阻止提交 |
 | `RATE_LIMITED` | 429 | 太频繁 | 按 `retryAfter` 退避 |
@@ -298,7 +342,7 @@ Content-Type: application/json
 
 > 依据：以上服务名与方法签名全部来自 cordis Inspect 的 host Service 清单
 > （本机 DSH 0.2.2-rc.1 实测），事件名来自 host Event 清单，事件数据结构
-> 用 `C:\Users\CGLY\.dsh\sessions\*\session.v4.jsonl.zstd` 真实日志逐条核对。
+> 用 `$DSH_HOME/sessions/*/session.v4.jsonl.zstd` 真实日志逐条核对。
 
 ---
 
@@ -313,6 +357,8 @@ Content-Type: application/json
 | 3.3.0 | 通道扩展（§10.1）：custom 模式（粘贴任意工具地址+格式校验+探活）；ngrok 托管（官方下载 size/sha256 校验 + config add-authtoken + http --domain 解析）；POST /api/transport/probe 探活接口；transport/mode 载荷扩展（参数随切持久化，token/authtoken 只落盘不回显）；配对页服务商预设折叠与卡片视觉升级 |
 | 3.4.0 | 审批策略可写（§9.6）：PUT :id/permission 增 approval（every-step↔ask / auto↔never），与 mode 任意组合；approval/policy 事件直写（dsh-user-approval setApprovalPolicy 同路径）；GET 回读一致 |
 | 3.5.0 | 会话列表最后一条消息预览（§3.1）：items 增 `preview`（≤60 字单行摘要，占位符规则见 §3.1 注记）+ `lastRole`（'user'\|'assistant'）；桥内存缓存（message.created/done 实时 + 启动/列表前 20 批量补齐），DSH 原生不带该数据；纯增量，CONTRACT_VERSION 仍为 3 |
+| 3.6.0 | 公网接入补充：14 项穿透服务目录、`tcp://` 根地址探活、本机通道专用凭据、新电脑安装脚本 |
+| 3.7.0 | 会话内媒体转出（§3.3）：投影层识别 markdown 链接与 `Presented <路径>` 行并按会话 cwd 展开；媒体块提升到助手消息；`GET /api/media/:id` 支持 `media:v1.<base64url(绝对路径)>`（白名单 realpath 校验，越权 404）；正文本机路径降级；纯增量，CONTRACT_VERSION 仍为 3 |
 
 ---
 

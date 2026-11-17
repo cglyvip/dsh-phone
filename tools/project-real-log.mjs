@@ -6,7 +6,7 @@
  * (28 B5 2F FD) 手工切帧再逐帧解压。
  *
  * 运行：node tools/project-real-log.mjs [会话日志路径]
- * 默认自动挑 C:\Users\CGLY\.dsh\sessions 下最大的那个日志。
+ * 默认自动挑 $DSH_HOME/sessions 下最大的那个日志。
  */
 import fs from 'node:fs';
 import path from 'node:path';

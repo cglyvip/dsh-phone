@@ -60,7 +60,11 @@ export class EventHub {
       const sessionId = session !== null && typeof session === 'object' && typeof session.id === 'string'
         ? session.id
         : '';
-      const envelope = eventToWire(sessionId, event);
+      // 会话工作区：媒体相对路径（`deliver/E9.mp4`）要按它展开成绝对路径才能转出字节。
+      const cwd = session !== null && typeof session === 'object' && typeof session.cwd === 'string'
+        ? session.cwd
+        : '';
+      const envelope = eventToWire(sessionId, event, { cwd });
       if (envelope === null) return;
       this.publish(envelope.name, sessionId, envelope.timestamp, envelope.payload, envelope.seq);
     });

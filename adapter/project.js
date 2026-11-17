@@ -13,8 +13,10 @@
  *   - model/selection:   data = { provider, model, reasoningEffort? }
  *
  * 证据等级：[官方源码] —— 事件名与结构取自 cordis Inspect 的 SessionEventMap，
- * 并用 C:\Users\CGLY\.dsh\sessions 下真实 session.v4.jsonl.zstd 逐条核对。
+ * 并用 $DSH_HOME/sessions 下真实 session.v4.jsonl.zstd 逐条核对。
  */
+
+import path from 'node:path';
 
 /**
  * 本机绝对路径（Windows 盘符 / UNC），手机端无法加载。
@@ -26,13 +28,63 @@ function isLocalAbsolutePath(value) {
   return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\');
 }
 
-const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
+/** 普通 markdown 链接 `[文字](<路径>)`：交付类工具常用它给出视频/图片（`!` 开头的图片语法除外）。 */
+const MARKDOWN_LINK = /(?<!!)\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
+/** 任意 markdown 链接/图片语法（抽取媒体时两者都要看）。 */
+const MARKDOWN_ANY_LINK = /!?\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
 
-/** 去掉指向本机磁盘的图片 markdown（图片本身改由 image 块渲染）。 */
+/** 媒体扩展名白名单（只有这些才当作可下发的媒体，避免把普通文档当视频）。 */
+const VIDEO_EXT = /\.(mp4|mov|m4v|webm|mkv|avi|3gp)$/i;
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|heic)$/i;
+
+/** 媒体扩展名 → MIME（手机端 Video/Image 组件据此选解码器）。 */
+const MEDIA_MIME = {
+  mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
+  mkv: 'video/x-matroska', avi: 'video/x-msvideo', '3gp': 'video/3gpp',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic',
+};
+
+/** 按扩展名判断媒体类型：'video' | 'image' | ''（不是媒体）。 */
+export function mediaKindOf(value) {
+  const text = String(value ?? '').split('?')[0].split('#')[0];
+  if (VIDEO_EXT.test(text)) return 'video';
+  if (IMAGE_EXT.test(text)) return 'image';
+  return '';
+}
+
+/** 按扩展名猜 MIME，猜不到给空串（手机端会按块类型兜底）。 */
+function mediaMimeOf(value) {
+  const text = String(value ?? '').split('?')[0].split('#')[0];
+  const dot = text.lastIndexOf('.');
+  if (dot < 0) return '';
+  return MEDIA_MIME[text.slice(dot + 1).toLowerCase()] ?? '';
+}
+
+/**
+ * 去掉指向本机磁盘的图片 markdown（图片本身改由 image 块渲染），
+ * 并把本机媒体链接降级为可读文字：
+ *   `[demo](<deliver/demo.mp4>)` → `demo`
+ * 媒体字节已由 media 块承载，正文里再留一串路径只会让手机用户困惑。
+ * 只处理媒体扩展名且没有 http(s) 等 scheme 的目标，普通文档链接保持原样。
+ */
 function stripLocalMediaPaths(text) {
   if (typeof text !== 'string' || text.length === 0) return '';
   return text
     .replace(MARKDOWN_IMAGE, (whole, alt, target) => (isLocalAbsolutePath(target) ? '' : whole))
+    .replace(MARKDOWN_LINK, (whole, label, target) => {
+      const clean = String(target ?? '').trim();
+      if (clean.length === 0 || /^[a-z][a-z0-9+.-]*:/i.test(clean)) return whole;
+      if (mediaKindOf(clean).length === 0) return whole;
+      const name = String(label ?? '').trim();
+      return name.length > 0 ? name : path.basename(clean);
+    })
+    // present 工具逐行输出 `Presented <绝对路径>`：媒体已由块承载，正文只留文件名
+    .replace(/^\s*Presented\s+(.+?)\s*$/gim, (whole, target) => {
+      const clean = String(target ?? '').replace(/^[`'"]|[`'"]$/g, '').trim();
+      return mediaKindOf(clean).length > 0 ? path.basename(clean) : whole;
+    })
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -43,7 +95,39 @@ function fileNameOfUrl(url) {
   const clean = url.split('?')[0].split('#')[0];
   const parts = clean.split('/');
   const last = parts.length > 0 ? parts[parts.length - 1] : '';
-  return decodeURIComponent(last);
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
+/**
+ * 把正文里的本机路径解析成绝对路径。
+ * 相对路径按会话工作区（cwd）展开；拿不到 cwd 时返回空串（宁可不给，也不猜）。
+ */
+function resolveLocalPath(target, cwd) {
+  const value = typeof target === 'string' ? target.trim() : '';
+  if (value.length === 0) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return ''; // http(s):// 等外链，桥无法代理
+  if (value.startsWith('#')) return '';
+  if (isLocalAbsolutePath(value)) return path.normalize(value);
+  const base = typeof cwd === 'string' ? cwd.trim() : '';
+  if (base.length === 0) return '';
+  return path.resolve(base, value);
+}
+
+/**
+ * 把本地绝对路径编码成桥可服务的媒体 ID：`media:v1.<base64url>`。
+ *
+ * 为什么复用 `media:` 前缀：手机端（鸿蒙 1.0.x 及更早）已有
+ * 「attachmentId 以 media: 开头 → 走 /api/media/<id>」的分流逻辑，
+ * 沿用前缀可以让老客户端无需升级就能加载会话工作区里的任意媒体。
+ * 纯文件名仍是老的 v0 形态（dsh-imagegen/videos/files 目录）。
+ */
+function encodeLocalMediaId(absolutePath) {
+  if (typeof absolutePath !== 'string' || absolutePath.length === 0) return '';
+  return `media:v1.${Buffer.from(absolutePath, 'utf8').toString('base64url')}`;
 }
 
 /**
@@ -56,50 +140,103 @@ function fileNameOfUrl(url) {
  *   generate_video → {"videos":[{"url":"/api/dsh-imagegen/video/file/<file>.mp4",
  *                                "mime":"video/mp4","duration":5}]}
  *
- * 图片走附件字节（/api/attachments/:id），视频走桥的媒体文件路由（/api/media/<file>），
+ * 另外两种「不是 JSON」的交付形状也必须认（2026-11-17 实测）：
+ *   present 工具     → 逐行 `Presented D:\\work\\deliver\\demo.mp4`
+ *   助手正文 markdown → `[demo](<deliver/demo.mp4>)`（尖括号包裹的相对路径）
+ *
+ * 图片走附件字节（/api/attachments/:id），视频走桥的媒体文件路由（/api/media/<id>），
  * 两者都变成手机可直接加载的块，不再依赖电脑上的路径。
+ *
+ * @param {string} text 工具结果 / 助手正文
+ * @param {string} [cwd] 会话工作区，用于把相对路径展开成绝对路径
  */
-function extractMediaBlocks(text) {
+function extractMediaBlocks(text, cwd = '') {
   const blocks = [];
   if (typeof text !== 'string' || text.length === 0) return blocks;
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return blocks;
-  }
-  if (parsed === null || typeof parsed !== 'object') return blocks;
 
-    const images = Array.isArray(parsed.images) ? parsed.images : [];
-  for (const image of images) {
-    if (image === null || typeof image !== 'object') continue;
-    const id = typeof image.attachment_id === 'string' ? image.attachment_id : '';
-    if (id.length === 0) continue;
-    blocks.push({
-      type: 'image',
+  const seen = new Set();
+  const push = (block) => {
+    if (block === null) return;
+    const key = `${block.type}|${block.attachmentId}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    blocks.push(block);
+  };
+
+  /** 把一条「可能是本机路径」的引用变成 image/video 块。 */
+  const pushLocal = (target, label) => {
+    const absolute = resolveLocalPath(target, cwd);
+    if (absolute.length === 0) return;
+    const kind = mediaKindOf(absolute);
+    if (kind.length === 0) return;
+    const id = encodeLocalMediaId(absolute);
+    if (id.length === 0) return;
+    const name = String(label ?? '').trim() || path.basename(absolute);
+    push({
+      type: kind,
       attachmentId: id,
-      mediaType: typeof image.media_type === 'string' ? image.media_type : '',
-      width: typeof image.width === 'number' ? image.width : 0,
-      height: typeof image.height === 'number' ? image.height : 0,
-      name: typeof image.name === 'string' ? image.name : '',
-    });
-  }
-
-  const videos = Array.isArray(parsed.videos) ? parsed.videos : [];
-  for (const video of videos) {
-    if (video === null || typeof video !== 'object') continue;
-    const url = typeof video.url === 'string' ? video.url : '';
-    const name = fileNameOfUrl(url);
-    if (name.length === 0) continue;
-    blocks.push({
-      type: 'video',
-      attachmentId: `media:${name}`,
-      mediaType: typeof video.mime === 'string' ? video.mime : '',
+      mediaType: mediaMimeOf(absolute),
       width: 0,
       height: 0,
       name,
     });
+  };
+
+  // ① JSON 形状（生图 / 生视频工具的原始输出）
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
   }
+  if (parsed !== null && typeof parsed === 'object') {
+    const images = Array.isArray(parsed.images) ? parsed.images : [];
+    for (const image of images) {
+      if (image === null || typeof image !== 'object') continue;
+      const id = typeof image.attachment_id === 'string' ? image.attachment_id : '';
+      if (id.length === 0) continue;
+      push({
+        type: 'image',
+        attachmentId: id,
+        mediaType: typeof image.media_type === 'string' ? image.media_type : '',
+        width: typeof image.width === 'number' ? image.width : 0,
+        height: typeof image.height === 'number' ? image.height : 0,
+        name: typeof image.name === 'string' ? image.name : '',
+      });
+    }
+
+    const videos = Array.isArray(parsed.videos) ? parsed.videos : [];
+    for (const video of videos) {
+      if (video === null || typeof video !== 'object') continue;
+      const url = typeof video.url === 'string' ? video.url : '';
+      const name = fileNameOfUrl(url);
+      if (name.length === 0) continue;
+      push({
+        type: 'video',
+        attachmentId: `media:${name}`,
+        mediaType: typeof video.mime === 'string' ? video.mime : '',
+        width: 0,
+        height: 0,
+        name,
+      });
+    }
+  }
+
+  // ② markdown 链接 / 图片语法（助手正文最常见的交付形态）
+  MARKDOWN_ANY_LINK.lastIndex = 0;
+  let link;
+  while ((link = MARKDOWN_ANY_LINK.exec(text)) !== null) {
+    pushLocal(link[2], link[1]);
+  }
+
+  // ③ `Presented <路径>` 逐行输出（present 工具）
+  const PRESENTED_LINE = /^\s*Presented\s+(.+?)\s*$/gim;
+  let presented;
+  while ((presented = PRESENTED_LINE.exec(text)) !== null) {
+    const target = presented[1].replace(/^[`'"]|[`'"]$/g, '').trim();
+    pushLocal(target, '');
+  }
+
   return blocks;
 }
 
@@ -325,7 +462,7 @@ function usageToWire(usage) {
  *   meta:     会话级配置事件（权限预设 / 沙箱 / 审批 / 模型选择）
  *   title:    最新标题
  */
-export function projectEvents(events) {
+export function projectEvents(events, options = {}) {
   const messages = [];
   const turns = [];
   const meta = { preset: '', sandbox: '', approval: '', model: undefined };
@@ -335,6 +472,37 @@ export function projectEvents(events) {
   const toolNames = new Map();
   let currentTurn = 0;
   let currentStep = 0;
+  /** 会话工作区：相对媒体路径（`deliver/demo.mp4`）按它展开成绝对路径。 */
+  const cwd = typeof options.cwd === 'string' ? options.cwd : '';
+
+  /**
+   * 把媒体块挂到「同 turn 最后一条助手消息」上。
+   *
+   * 为什么要提升：工具结果的媒体块按契约挂在 role:'tool' 消息里，
+   * 而手机端（鸿蒙 1.0.x）的工具行只渲染 args/resultText、完全不看 blocks，
+   * 所以只挂在 tool 上用户永远看不到视频。助手消息的媒体是必渲染的，
+   * 提升一份过去即可让老客户端无需升级就能显示。
+   * 找不到同 turn 助手消息时（例如只有工具事件）就只留在 tool 上。
+   */
+  const promoteToAssistant = (mediaBlocks) => {
+    if (mediaBlocks.length === 0) return;
+    let target = null;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant') continue;
+      if (message.turn !== currentTurn) break;
+      target = message;
+      break;
+    }
+    if (target === null) return;
+    if (!Array.isArray(target.blocks)) target.blocks = [];
+    for (const media of mediaBlocks) {
+      const exists = target.blocks.some(
+        (block) => block.type === media.type && block.attachmentId === media.attachmentId,
+      );
+      if (!exists) target.blocks.push(media);
+    }
+  };
 
   for (const event of Array.isArray(events) ? events : []) {
     if (event === null || typeof event !== 'object') continue;
@@ -420,6 +588,14 @@ export function projectEvents(events) {
           toolNames.set(block.id, block.name);
         }
       }
+      // 助手正文里的媒体链接（`[demo](<deliver/demo.mp4>)`）转成媒体块，
+      // 正文里的路径同时降级成可读文字，手机端才不会只看到一串本地路径。
+      const assistantText = textOfBlocks(message.content);
+      for (const media of extractMediaBlocks(assistantText, cwd)) {
+        if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
+          blocks.push(media);
+        }
+      }
       messages.push({
         id: typeof message.id === 'string' ? message.id : `a_${seq}`,
         seq,
@@ -452,13 +628,17 @@ export function projectEvents(events) {
       const blocks = blocksToWire(message.content);
       const rawText = textOfBlocks(message.content);
       const friendlyText = friendlyToolText(rawText);
-      // 生成类工具（生图/生视频）只返回媒体引用或路径，没有可渲染的块；
+      // 生成类工具（生图/生视频/交付）只返回媒体引用或路径，没有可渲染的块；
       // 这里把引用补成 image / video 块，手机端才能真正看到素材。
-      for (const media of extractMediaBlocks(rawText)) {
+      const mediaBlocks = [];
+      for (const media of extractMediaBlocks(rawText, cwd)) {
         if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
           blocks.push(media);
         }
+        mediaBlocks.push(media);
       }
+      // 手机端工具行不渲染 blocks，同 turn 助手消息上再挂一份（见 promoteToAssistant）。
+      promoteToAssistant(mediaBlocks);
       const error = data.error && typeof data.error === 'object' ? data.error : undefined;
       messages.push({
         id: typeof message.id === 'string' ? message.id : `t_${seq}`,
@@ -502,11 +682,11 @@ export function projectEvents(events) {
 /**
  * 按 turn 分页：取最后 N 个 turn（或截止到 beforeTurn 之前的 N 个）。
  * @param {unknown[]} events
- * @param {{ turns?: number, beforeTurn?: number }} options
+ * @param {{ turns?: number, beforeTurn?: number, cwd?: string }} options
  */
 export function pageByTurns(events, options = {}) {
   const wantTurns = Number.isInteger(options.turns) && options.turns > 0 ? Math.min(options.turns, 200) : 10;
-  const projected = projectEvents(events);
+  const projected = projectEvents(events, { cwd: options.cwd });
   const allTurns = projected.turns;
   if (allTurns.length === 0) {
     return {
@@ -575,12 +755,14 @@ export function pageByTurns(events, options = {}) {
  * 把单个事件转换成手机线事件（用于 WS 实时推送）。
  * 返回 null 表示该事件不需要下发（例如内部元数据事件）。
  */
-export function eventToWire(sessionId, event) {
+export function eventToWire(sessionId, event, options = {}) {
   if (event === null || typeof event !== 'object') return null;
   const type = event.type;
   const data = event.data && typeof event.data === 'object' ? event.data : {};
   const seq = typeof event.seq === 'number' ? event.seq : 0;
   const time = typeof event.time === 'number' ? event.time : 0;
+  /** 会话工作区（相对媒体路径按它展开），由 EventHub 从 session 对象上带下来。 */
+  const cwd = typeof options.cwd === 'string' ? options.cwd : '';
 
   if (type === 'turn/start') {
     return { name: 'turn.started', sessionId, seq, timestamp: time, payload: { turn: data.turn ?? 0 } };
@@ -618,6 +800,12 @@ export function eventToWire(sessionId, event) {
     const message = data.message && typeof data.message === 'object' ? data.message : {};
     const source = message.source && typeof message.source === 'object' ? message.source : {};
     const blocks = blocksToWire(message.content);
+    // 助手正文里的媒体链接 → 媒体块（与历史投影同一套规则）
+    for (const media of extractMediaBlocks(textOfBlocks(message.content), cwd)) {
+      if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
+        blocks.push(media);
+      }
+    }
     return {
       name: 'message.done',
       sessionId,
@@ -642,7 +830,7 @@ export function eventToWire(sessionId, event) {
     const blocks = blocksToWire(message.content);
     const rawText = textOfBlocks(message.content);
     const friendlyText = friendlyToolText(rawText);
-    for (const media of extractMediaBlocks(rawText)) {
+    for (const media of extractMediaBlocks(rawText, cwd)) {
       if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
         blocks.push(media);
       }

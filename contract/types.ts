@@ -11,7 +11,7 @@
 
 export const CONTRACT_VERSION = 3 as const;
 export const MIN_CONTRACT_VERSION = 3 as const;
-export const BRIDGE_VERSION = '3.5.0';
+export const BRIDGE_VERSION = '3.7.0';
 export const PROTOCOL = 'dsh-phone-bridge';
 
 // ── 通用 ────────────────────────────────────────────────────────────────
@@ -49,6 +49,14 @@ export interface ErrorBody {
 
 // ── 消息内容块 ──────────────────────────────────────────────────────────
 
+/**
+ * image / video 块的 attachmentId 有四种形态，客户端按前缀分流即可：
+ *   - `sha256:<64hex>`        → GET /api/attachments/:id（v3.1 上传附件）
+ *   - `media:<文件名>`         → GET /api/media/:id（v3.0 生视频，仅 $DSH_HOME/dsh-imagegen/videos/files）
+ *   - `media:v1.<base64url>`  → GET /api/media/:id（v3.7 会话工作区任意媒体文件的绝对路径）
+ * 客户端取 URL 时不要把 `media:` 前缀带进路径，桥端两种形态都接受。
+ * 白名单外的路径一律 404 MEDIA_NOT_FOUND，不区分「不存在」与「无权限」。
+ */
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
@@ -318,6 +326,9 @@ export const REST_ROUTES = [
   { method: 'GET', path: '/api/sessions/:id/permission', auth: true, note: 'v3.1 §9.5 当前权限模式 {mode, approval}' },
   { method: 'PUT', path: '/api/sessions/:id/permission', auth: true, note: 'v3.4 §9.6 运行时改权限 {mode?, approval?} 任意组合（approval: every-step↔ask / auto↔never）；成功后广播 session.updated' },
   { method: 'POST', path: '/api/uploads', auth: true, note: 'v3.1 原始字节流上传，X-File-Name（URL编码）+ X-Media-Type 头，上限 200MB' },
+  { method: 'GET', path: '/api/attachments/:id', auth: true, note: 'v3.1 图片附件字节（sha256:<64hex>），支持 Range' },
+  { method: 'GET', path: '/api/media/:id', auth: true, note: 'v3.7 媒体字节：media:v1.<base64url(绝对路径)> 指向会话工作区/工作区/生图目录内的文件；老形态 media:<文件名> 仍兼容。白名单外或非媒体扩展名一律 404/400，支持 Range' },
+  { method: 'GET', path: '/api/files/:id', auth: true, note: 'v3.1 通用文件附件字节（sha256:<64hex>）' },
   { method: 'GET', path: '/api/models', auth: true },
   { method: 'GET', path: '/api/settings/model', auth: true },
   { method: 'PUT', path: '/api/settings/model', auth: true },

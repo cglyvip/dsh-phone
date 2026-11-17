@@ -13,7 +13,7 @@
  */
 
 import { BridgeError, ErrorCode, asBridgeError } from '../bridge/errors.js';
-import { lastChatMessage, pageByTurns, previewOfBlocks, projectEvents } from './project.js';
+import { lastChatMessage, mediaKindOf, pageByTurns, previewOfBlocks, projectEvents } from './project.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,6 +37,15 @@ const PREVIEW_BACKFILL_LIMIT = 20;
 
 /** v3.5：预览缓存上限（防长期运行无限增长；超出按插入序淘汰）。 */
 const PREVIEW_CACHE_LIMIT = 1000;
+
+/**
+ * v3.7：媒体块 ID 的 v1 前缀 —— `media:v1.<base64url(绝对路径)>`
+ * （编码端见 project.js 的 encodeLocalMediaId）。
+ */
+const MEDIA_ID_V1 = 'media:v1.';
+
+/** v3.7：媒体白名单根的缓存时长（毫秒）。 */
+const MEDIA_ROOTS_TTL = 60 * 1000;
 
 /**
  * v3.1 §9.5 会话权限 3 档 ↔ DSH 旋钮值的映射。
@@ -295,6 +304,8 @@ export class DshAdapter {
     const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
     this.modelFile = path.join(home, 'phone-bridge', 'model.json');
     this.preferredModel = this.readPreferredModel();
+    // v3.7：/api/media 白名单根缓存（见 mediaRoots()）
+    this._mediaRoots = null;
   }
 
   /** 读取桥偏好模型（容错，读不到返回空）。 */
@@ -412,7 +423,7 @@ export class DshAdapter {
    * [官方源码] sessionController.list() → { items: SessionSummary[] }
    * [官方源码] sessionQuery.readTitleSnapshots(ids) → [{sessionId,status,value:{session,title?}}]
    */
-  async listSessions(archived = false) {
+  async listSessions(archived = false, options = {}) {
     try {
       let items = [];
       const controller = this.optional('sessionController');
@@ -457,7 +468,8 @@ export class DshAdapter {
         return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
       });
       // v3.5：缓存缺失的会话排在最前的（≤20 个）进后台补齐队列，不阻塞本次响应。
-      this.schedulePreviewBackfill(filtered);
+      // 媒体白名单只借用 cwd，不需要预览，用 skipPreview 避免在媒体请求路径上产生额外日志读取。
+      if (options.skipPreview !== true) this.schedulePreviewBackfill(filtered);
       return filtered.map((item) => {
         const entry = this.previewCache.get(item.sessionId);
         return {
@@ -643,7 +655,8 @@ export class DshAdapter {
           this.log(`读取会话状态失败: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      const projected = projectEvents(snapshot.events);
+      // 传 cwd：会话正文里的相对媒体路径要靠它展开（见 project.js resolveLocalPath）。
+      const projected = projectEvents(snapshot.events, { cwd: header !== null ? header.cwd : '' });
       return {
         session: header,
         title: titles.get(sessionId) ?? projected.title,
@@ -668,9 +681,12 @@ export class DshAdapter {
       if (snapshot === null || typeof snapshot !== 'object') {
         throw new BridgeError(ErrorCode.SESSION_NOT_FOUND, '会话不存在', { detail: { sessionId } });
       }
+      const header = headerToWire(snapshot.session);
       const page = pageByTurns(snapshot.events, {
         turns: options.turns,
         beforeTurn: options.beforeTurn,
+        // 相对媒体路径按会话工作区展开（见 project.js resolveLocalPath）。
+        cwd: header !== null ? header.cwd : '',
       });
       const titles = await this.readTitles([sessionId]);
       return {
@@ -1692,25 +1708,119 @@ export class DshAdapter {
   }
 
   /**
-   * 读取一个已落盘的媒体文件（目前用于 AI 生成视频）。
+   * 媒体白名单根：只有落在这些目录之内的文件才允许经 /api/media 转出字节。
+   *
+   * 为什么需要白名单：v3.7 起媒体 ID 可以是会话工作区里的任意路径
+   * （`media:v1.<base64url(绝对路径)>`，编码端见 project.js），
+   * 而手机端拿到的 ID 来自会话内容，不能当作可信输入 —— 否则等于把整台电脑的
+   * 文件系统暴露给任何持有访问令牌的客户端。
+   *
+   * 白名单来源：
+   *   - 所有会话的工作区（cwd）—— 交付类工具把视频写到会话目录下
+   *   - 所有已注册工作区路径
+   *   - $DSH_HOME/dsh-imagegen —— 生图/生视频插件的落盘目录
+   *
+   * 结果缓存 60 秒（会话与工作区变化不频繁，避免每次请求都拉一遍列表）。
+   *
+   * @returns {Promise<string[]>} 已 realpath 归一化的绝对目录（小写比较见 isInsideRoot）
+   */
+  async mediaRoots() {
+    const now = Date.now();
+    if (this._mediaRoots !== null && now - this._mediaRoots.at < MEDIA_ROOTS_TTL) {
+      return this._mediaRoots.roots;
+    }
+    const raw = [];
+    const home = this.dshHome();
+    raw.push(path.join(home, 'dsh-imagegen'));
+    try {
+      const sessions = await this.listSessions(false, { skipPreview: true });
+      for (const item of sessions) {
+        if (typeof item.cwd === 'string' && item.cwd.length > 0) raw.push(item.cwd);
+      }
+    } catch (error) {
+      this.log(`媒体白名单：读会话工作区失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      const archived = await this.listSessions(true, { skipPreview: true });
+      for (const item of archived) {
+        if (typeof item.cwd === 'string' && item.cwd.length > 0) raw.push(item.cwd);
+      }
+    } catch (error) {
+      // 归档列表失败不影响主流程
+    }
+    try {
+      const workspaces = await this.listWorkspaces();
+      for (const item of workspaces.items) {
+        if (typeof item.path === 'string' && item.path.length > 0) raw.push(item.path);
+      }
+    } catch (error) {
+      // 工作区列表失败不影响主流程
+    }
+    const roots = [];
+    for (const candidate of raw) {
+      try {
+        // realpath：白名单里存的是真实路径，与目标文件比对时两边都归一化，
+        // 防止用符号链接把白名单外的目录「挂」进来。
+        const real = await fs.promises.realpath(candidate);
+        if (!roots.includes(real)) roots.push(real);
+      } catch {
+        // 目录不存在就跳过（会话可能指向已删除的工作区）
+      }
+    }
+    this._mediaRoots = { at: now, roots };
+    return roots;
+  }
+
+  /**
+   * 判断目标路径是否落在某个白名单根之内。
+   * Windows 路径大小写不敏感，统一转小写比较；同时防 `C:\a` 误匹配 `C:\ab`。
+   */
+  static isInsideRoot(target, root) {
+    const a = target.toLowerCase();
+    const b = root.toLowerCase();
+    if (a === b) return true;
+    const withSep = b.endsWith(path.sep) ? b : b + path.sep;
+    return a.startsWith(withSep);
+  }
+
+  /**
+   * 读取一个已落盘的媒体文件（AI 生成视频 / 会话交付的视频图片）。
+   *
+   * 两种 ID 形态：
+   *   ① 纯文件名（v0，兼容老客户端）：`abc.mp4`
+   *      → $DSH_HOME/dsh-imagegen/videos/files/<file>，只接受纯文件名。
+   *   ② `media:v1.<base64url(绝对路径)>`（v3.7）：任意本地媒体，
+   *      解码后必须 realpath 落在白名单根之内（见 mediaRoots）。
    *
    * 事实来源（dsh-imagegen-video 3.x 源码 + 本机实测）：
-   *   视频持久化在 $DSH_HOME/dsh-imagegen/videos/files/<file>，
+   *   生成视频持久化在 $DSH_HOME/dsh-imagegen/videos/files/<file>，
    *   工具结果只返回 `/api/dsh-imagegen/video/file/<file>` 这样的同源相对 URL，
-   *   字节从不进入会话。手机端加载不了电脑上的路径，所以由桥按文件名转出字节。
+   *   字节从不进入会话。手机端加载不了电脑上的路径，所以由桥转出字节。
    *
-   * 只接受纯文件名（拒绝任何目录分隔符与 `..`），避免路径穿越。
-   *
-   * @param {string} name 视频文件名，例如 `abc.mp4`
+   * @param {string} name 媒体 ID，例如 `abc.mp4` 或 `media:v1.ZDpc...`
    * @returns {Promise<{ root: string, fileName: string }>}
    */
   async mediaFilePath(name) {
-    const fileName = typeof name === 'string' ? name.trim() : '';
-    if (fileName.length === 0 || fileName !== path.basename(fileName) || fileName.includes('..')) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
+    const id = typeof name === 'string' ? name.trim() : '';
+    if (id.length === 0) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不能为空');
     }
 
-    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    // v1 形态：`media:v1.<base64url>`；手机端 1.0.x 会把 `media:` 前缀剥掉再请求
+    // （ApiClient.mediaSrcOf → mediaUrl(id.substring(6))），所以这里两种都要认。
+    if (id.startsWith(MEDIA_ID_V1)) {
+      return this.resolveLocalMediaPath(id.slice(MEDIA_ID_V1.length));
+    }
+    if (id.startsWith('v1.')) {
+      return this.resolveLocalMediaPath(id.slice(3));
+    }
+
+    // v0：纯文件名形态
+    const fileName = id;
+    if (fileName !== path.basename(fileName) || fileName.includes('..')) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
+    }
+    const home = this.dshHome();
     const file = path.join(home, 'dsh-imagegen', 'videos', 'files', fileName);
     let stat = null;
     try {
@@ -1722,6 +1832,51 @@ export class DshAdapter {
       throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
     }
     return { root: path.dirname(file), fileName };
+  }
+
+  /**
+   * 解码 `media:v1.` 后面的 base64url 绝对路径，校验白名单后返回可流式响应的位置。
+   *
+   * @param {string} encoded base64url(utf8 绝对路径)
+   */
+  async resolveLocalMediaPath(encoded) {
+    let absolute = '';
+    try {
+      absolute = Buffer.from(encoded, 'base64url').toString('utf8');
+    } catch {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 解码失败');
+    }
+    if (absolute.length === 0 || !path.isAbsolute(absolute)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不是绝对路径');
+    }
+    // 先按扩展名挡一道：只服务白名单内的媒体类型，避免把任意文件（密钥、配置）当媒体转出
+    if (mediaKindOf(absolute).length === 0) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 指向的不是支持的媒体类型');
+    }
+    const fileName = path.basename(absolute);
+
+    let real = '';
+    let stat = null;
+    try {
+      real = await fs.promises.realpath(absolute);
+      stat = await fs.promises.stat(real);
+    } catch {
+      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在', { detail: { name: fileName } });
+    }
+    if (!stat.isFile()) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
+    }
+
+    const roots = await this.mediaRoots();
+    const allowed = roots.some((root) => DshAdapter.isInsideRoot(real, root));
+    if (!allowed) {
+      // 越权读取：路径本身合法但不在任何会话工作区 / 生成目录内，按 404 处理，
+      // 不向客户端透露「文件存在但你没权限」这一信息。
+      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不在允许的目录内', { detail: { name: fileName } });
+    }
+    // 用 realpath 之后的文件名：源路径可能是符号链接，交给 send 时必须是真实文件名，
+    // 否则 send(root, 链接名) 会因为目录里没有这个名字而 404。
+    return { root: path.dirname(real), fileName: path.basename(real) };
   }
 
   // ── 附件上传（v3.1，contract.md §9.1）───────────────────────────────────
