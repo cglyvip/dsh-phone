@@ -320,6 +320,7 @@ node --test tools/test-cloudflare-startup.mjs tools/test-transport-startup.mjs t
 - v3.7.0：会话内媒体转出，电脑端交付的视频手机能收到（`media:v1.` 绝对路径 + 白名单校验）
 - v3.7.1：frp 代理名冲突可识别并自动退避重连（不再卡在「正在启动」）
 - v3.7.2：frp 代理名按本机唯一化 + 启动前清理遗留 frpc，多台电脑连同一台 frps 不再撞名
+- v3.7.3：安装脚本兼容 npm 在包内生成的自引用链接（新版本 npm 下安装不再被拦）
 
 ---
 

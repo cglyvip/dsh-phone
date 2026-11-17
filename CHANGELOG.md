@@ -1,5 +1,28 @@
 ﻿# CHANGELOG
 
+## 3.7.3（2026-11-17）
+
+### 修复（安装脚本被 npm 的自引用链接挡住）
+
+在另一台电脑（npm 版本较新）上执行 `.\tools\install-local.ps1` 报：
+
+```
+Refusing to move or copy a tree containing a junction or symbolic link:
+...\Temp\dsh-phone-bridge-install-...\package\node_modules\dsh-phone-bridge
+```
+
+原因：`npm install --prefix` 会在包自己的 `node_modules` 里放一个指向包自身的
+目录联接（`node_modules\dsh-phone-bridge` → `..`），好让包能按自己的名字 import 自己。
+脚本的 `Assert-TreeNoReparsePoint` 把所有 reparse point 一律当作危险链接拒绝，
+于是安装直接失败；即使放过，后面 `Copy-Item -Recurse` 也会顺着链接无限展开。
+
+修复：`npm install` 之后、树检查之前，把这个**只在它确实是链接时**删掉
+（用 `[System.IO.Directory]::Delete($path, $false)` 而不是 `Remove-Item -Recurse`——
+后者会顺着链接把目标里的内容一起删掉）。它对安装结果没有用处，删掉不影响插件运行。
+
+本机 npm 版本不会产生这个链接，已单独构造 junction 验证：链接删除后
+包内 `index.js`、`package.json` 与 `node_modules` 目录均完好，树检查通过。
+
 ## 3.7.2（2026-11-17）
 
 ### 修复（同一台 frps 上的第二台电脑永远连不上）

@@ -156,6 +156,20 @@ Assert-TreeNoReparsePoint -Path $stagedPackage
 if ($LASTEXITCODE -ne 0) {
     throw 'Installing isolated plugin dependencies failed. Existing installed plugins were not changed.'
 }
+
+# npm 会在包自己的 node_modules 里放一个指向包自身的链接
+# （node_modules\dsh-phone-bridge -> ..），好让包能按自己的名字 import 自己。
+# 它对安装结果没用，却会让下面的 reparse point 检查直接失败，
+# 后面递归拷贝时还可能顺着链接无限展开。只在它确实是链接时删掉链接本身
+# （用 Directory.Delete 而不是 Remove-Item -Recurse：后者会顺着链接删掉目标里的内容）。
+$selfLink = Join-Path $stagedPackage 'node_modules\dsh-phone-bridge'
+if (Test-Path -LiteralPath $selfLink) {
+    $selfLinkItem = Get-Item -LiteralPath $selfLink -Force
+    if (($selfLinkItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        [System.IO.Directory]::Delete($selfLink, $false)
+    }
+}
+
 Assert-TreeNoReparsePoint -Path $stagedPackage
 $stagedManifest = Read-JsonFile -Path (Join-Path $stagedPackage 'package.json')
 if ($stagedManifest.name -ne 'dsh-phone-bridge' -or $stagedManifest.version -ne $sourceManifest.version) {
