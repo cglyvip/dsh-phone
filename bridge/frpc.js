@@ -214,10 +214,22 @@ export function parseFrpcLine(line) {
   if (/login to server failed/i.test(text)) {
     return { event: 'login-fail', message: text.trim().slice(0, 300) };
   }
-  if (/start proxy (?:success|fail)/i.test(text)) {
-    if (/fail/i.test(text)) return { event: 'proxy-fail', message: text.trim().slice(0, 300) };
+  if (/start proxy success/i.test(text)) {
     const port = extractRemotePort(text);
     return { event: 'proxy-start', ...(port !== null ? { remotePort: port } : {}) };
+  }
+  if (/start proxy fail/i.test(text)) {
+    return { event: 'proxy-fail', message: text.trim().slice(0, 300) };
+  }
+  // frpc 0.6x 起，「代理注册失败」不再走 start proxy fail，而是单独一行
+  // `[name] start error: proxy [name] already exists`（同名代理已被别的 frpc 占用）
+  // 或 `[name] start error: port already used`（远程端口被占）。
+  // 这类行以前被当成无关日志丢弃，桥会永远停在「正在启动」，配对页看不到任何原因。
+  // 只取冒号后的内容作为原因：前面的时间戳与 run id 会把界面上的关键信息挤掉。
+  if (/start error/i.test(text)) {
+    const marker = text.search(/start error/i);
+    const detail = text.slice(marker + 'start error'.length).replace(/^\s*[:：]?\s*/, '').trim();
+    return { event: 'proxy-fail', message: (detail.length > 0 ? detail : text.trim()).slice(0, 300) };
   }
   if (/login to server success/i.test(text)) {
     return { event: 'login' };

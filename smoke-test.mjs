@@ -1633,6 +1633,64 @@ async function main() {
   assert.ok(okSpawner.spawns[0].args.includes('-c'), 'frpc 启动参数带 -c 配置路径');
   pass('frp 通道运行态（frps 分配端口回填 publicUrl + token 不入状态/日志）');
 
+  // 26c) 代理名冲突：frpc 不退出，只吐一行 start error
+  //      （回归：旧解析器只认 start proxy fail，这类行被丢弃，界面永远停在「正在启动」看不到原因）
+  const conflictLines = [
+    '2026/11/17 22:54:36 [I] [client/service] login to server success, get run id [c061b677]',
+    '2026/11/17 22:54:36 [I] [proxy/proxy_manager] [c061b677] proxy added: [dsh-phone-bridge]',
+    '2026/11/17 22:54:37 [W] [client/control] [c061b677] [dsh-phone-bridge] start error: proxy [dsh-phone-bridge] already exists',
+  ];
+  const conflictSpawner = makeFrpcSpawner({ lines: conflictLines, exitAfterMs: -1 }); // 关键：frpc 不退出
+  const transportF2 = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 27000, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: conflictSpawner.spawnImpl,
+    backoffBaseMs: 20,
+    conflictRetryBaseMs: 60_000, // 退避拉长，保证观察窗口内不会真的重连
+  });
+  await transportF2.start({ localPort: 8787 });
+  const conflictStatus = await waitForCondition(
+    () => transportF2.status(),
+    (value) => value.tunnelStatus === 'starting' && value.tunnelError.includes('already exists'),
+    4000,
+    '代理名冲突时界面给出具体原因',
+  );
+  assert.ok(conflictStatus.tunnelError.includes('自动重试'), `冲突应说明会自动重试（实际：${conflictStatus.tunnelError}）`);
+  assert.equal(conflictSpawner.spawns.length, 1, '退避期间不重复拉起进程');
+  await transportF2.stop();
+  pass('frp 代理名冲突（start error 可识别，界面显示原因与自动重试）');
+
+  // 26d) 代理名冲突自动重试：frps 要等旧连接心跳超时才释放，桥应自己退避重连，
+  //      重试次数用尽后给出「另一台电脑占用」的明确指引
+  const retrySpawner = makeFrpcSpawner({ lines: conflictLines, exitAfterMs: -1 });
+  const transportF3 = new TransportManager({
+    config: normalizeTransportConfig({
+      tunnelMode: 'frp',
+      frp: { serverAddr: '203.0.113.10', serverPort: 7000, token: frpToken, remotePort: 27000, useTls: false },
+    }),
+    home: frpcHomeE,
+    log: frpLog,
+    spawnImpl: retrySpawner.spawnImpl,
+    backoffBaseMs: 20,
+    conflictRetryBaseMs: 20, // 毫秒级退避，避免测试等 30 秒
+    maxConflictRetries: 2,
+  });
+  await transportF3.start({ localPort: 8787 });
+  const retryStatus = await waitForCondition(
+    () => transportF3.status(),
+    (value) => value.tunnelStatus === 'error' && value.tunnelError.includes('持续被占用'),
+    5000,
+    '代理冲突重试次数用尽后报错',
+  );
+  assert.equal(retrySpawner.spawns.length, 3, '首次 + 2 次自动重试');
+  assert.ok(retryStatus.tunnelError.includes('另一台电脑'), `超限提示应指向另一台电脑（实际：${retryStatus.tunnelError}）`);
+  await transportF3.stop();
+  pass('frp 代理名冲突自动重试（用尽后提示另一台电脑占用）');
+
   // 27) v3.2 §10：通道统一状态机切换（停旧起新 + 持久化 + 失败降级）
   let quickStopped = 0;
   const quickStarter = async () => {

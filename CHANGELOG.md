@@ -1,5 +1,45 @@
 ﻿# CHANGELOG
 
+## 3.7.1（2026-11-17）
+
+### 修复（frp 一直连不上电脑）
+
+现象：配对页 frp 通道长时间停在「正在启动」，最后报错也看不出原因；
+手动跑 frpc 却只看到 `login to server success` 之后紧跟一行
+`[dsh-phone-bridge] start error: proxy [dsh-phone-bridge] already exists`。
+
+排查结论：frps（`144.24.55.61:7000`）可达、token 正确、`remotePort` 未被占用，
+唯一失败点是**代理名 `dsh-phone-bridge` 在 frps 上仍被登记**——上一轮 frpc 的连接
+没正常注销，frps 要等心跳超时（实测约 100 秒）才释放。代码侧有两个缺陷把这件事
+藏了起来：
+
+- **解析盲区**（`bridge/frpc.js`）：`parseFrpcLine()` 只认 `start proxy fail`。
+  frpc 0.6x 起代理注册失败改吐 `start error: ...`，这一行被当成无关日志丢弃，
+  状态机收不到任何失败信号，界面永远停在「正在启动」。
+  现在单独识别 `start error`，并只取冒号后的内容作为原因
+  （时间戳和 run id 会把界面上的关键信息挤掉）。
+- **失败态没落地**（`bridge/transport.js`）：原 `proxy-fail` 分支只改 `error` 字段、
+  `status` 仍是 `starting`；而 frpc 在代理注册失败时**进程不退出**（实测观察 25 秒仍在），
+  不会触发崩溃重启。现在失败态直接落到 `error`。
+
+### 新增（代理冲突自动重试）
+
+代理名/端口冲突是可自愈的（frps 释放后重连即可），frpc 自己不会重试：
+
+- 新增 `isConflictError()`，识别 `already exists` / `already used` / `proxy ... conflict`。
+- 命中冲突时按 `30s / 60s / 90s / 120s` 线性退避自动重连，最多 4 次；
+  退避期间界面显示原因与「N 秒后自动重试（n/4）」，不用手动反复点「保存并切换」。
+- 重试次数用尽后报明确指引：通常是另一台电脑仍在跑同一份 frp 配置，
+  先在那台电脑停掉通道，或把本机 `remotePort` 换成别的端口。
+- 代理注册成功即清零冲突计数，避免一次长连接断开就顶到上限。
+- 冲突重试与崩溃重启分开计数（`scheduleConflictRetry`），互不影响。
+- `conflictRetryBaseMs` / `maxConflictRetries` 可注入，测试用毫秒级退避。
+
+### 测试
+
+- 冒烟测试增至 75 项，新增两组：代理名冲突时界面给出原因与自动重试（不卡在「正在启动」）、
+  冲突自动重试用尽后提示「另一台电脑占用」。
+
 ## 3.7.0（2026-11-17）
 
 ### 修复（电脑端发的视频手机收不到）

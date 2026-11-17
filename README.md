@@ -216,6 +216,11 @@ http://127.0.0.1:9000/pair
 VPS 防火墙/安全组需要放行 frps 的 bindPort 与映射端口，frps 如果设置了 `allowPorts`，
 新端口还必须在允许范围内。出现 `port already used` 时先检查旧电脑是否仍占用该端口。
 
+frps 上的代理名 `dsh-phone-bridge` 同样只能有一个连接占用。上一轮 frpc 没正常注销时，
+frps 要等心跳超时（约 100 秒）才释放，期间连上也会被拒。桥识别到这类冲突会按
+30/60/90/120 秒自动退避重连，最多 4 次，配对页显示「N 秒后自动重试」；4 次都没成，
+说明另一台电脑确实还占着这份配置，按提示停掉它或换 `remotePort`。
+
 `token` 留空只表示保留**这台电脑已保存的** frps 密钥；新电脑首次配置仍须输入服务器密钥。
 它不会自动从旧电脑取回，也不能用手机的配对令牌替代。
 
@@ -287,7 +292,7 @@ cd dsh-phone-bridge
 node smoke-test.mjs
 ```
 
-`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 73 项
+`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 75 项
 （REST 全部路由 + 鉴权 + 配对码一次性 + 按 turn 分页 + WS 握手/推送/过滤/增量/补拉
 + 六种公网通道切换与参数落盘 + `/api/media` 会话内媒体转出）。
 
@@ -307,6 +312,7 @@ node --test tools/test-cloudflare-startup.mjs tools/test-transport-startup.mjs t
 - v3.5.1：配对页补齐 frp 参数表单，换电脑不必手改 YAML
 - v3.6.0：14 项穿透服务目录、严格地址验证、本机通道控制和新电脑安装流程
 - v3.7.0：会话内媒体转出，电脑端交付的视频手机能收到（`media:v1.` 绝对路径 + 白名单校验）
+- v3.7.1：frp 代理名冲突可识别并自动退避重连（不再卡在「正在启动」）
 
 ---
 

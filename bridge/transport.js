@@ -34,6 +34,18 @@ export const TUNNEL_MODES = ['quick', 'named', 'frp', 'custom', 'ngrok', 'relay'
 
 const MAX_FRP_RESTARTS = 5;
 const FRP_BACKOFF_BASE_MS = 1000;
+/** 代理名/端口冲突的重试：frps 要等旧连接心跳超时（实测约 100 秒）才释放，线性退避。 */
+const FRP_CONFLICT_RETRY_BASE_MS = 30000;
+const MAX_FRP_CONFLICT_RETRIES = 4;
+
+/**
+ * 判断 frpc 的失败行是不是「代理名/端口被占」这类可自愈冲突。
+ * 这类冲突 frps 会在一段时间后释放，重连即可；其它错误（token 错、地址错）重试无意义。
+ */
+export function isConflictError(message) {
+  const text = typeof message === 'string' ? message : '';
+  return /already exists|already used|proxy .*conflict/i.test(text);
+}
 
 /** 归一化 transport 配置片段（来自桥 config + transport.json 覆盖）。 */
 export function normalizeTransportConfig(config) {
@@ -108,6 +120,7 @@ class FrpChannel {
    *   fetchJson?: (url: string) => Promise<any>,
    *   fetchBuffer?: (url: string) => Promise<Buffer>,
    *   backoffBaseMs?: number, maxRestarts?: number,
+   *   conflictRetryBaseMs?: number, maxConflictRetries?: number,
    * }} options
    */
   constructor(options) {
@@ -124,11 +137,19 @@ class FrpChannel {
     this.maxRestarts = Number.isInteger(options.maxRestarts) && options.maxRestarts > 0
       ? options.maxRestarts
       : MAX_FRP_RESTARTS;
+    // 冲突退避基数可注入（smoke-test 压到毫秒级，否则要等 30 秒）
+    this.conflictRetryBaseMs = Number.isInteger(options.conflictRetryBaseMs) && options.conflictRetryBaseMs > 0
+      ? options.conflictRetryBaseMs
+      : FRP_CONFLICT_RETRY_BASE_MS;
+    this.maxConflictRetries = Number.isInteger(options.maxConflictRetries) && options.maxConflictRetries > 0
+      ? options.maxConflictRetries
+      : MAX_FRP_CONFLICT_RETRIES;
     this.child = null;
     this.exePath = '';
     this.configPath = '';
     this.stopping = false;
     this.restarts = 0;
+    this.conflictRetries = 0;
     this.restartTimer = null;
     this.state = { status: 'starting', url: '', error: '' };
     this.binary = 'none';
@@ -154,10 +175,14 @@ class FrpChannel {
     this.spawnFrpc();
   }
 
-  spawnFrpc() {
+  /**
+   * @param {string} [pendingError] 保留给界面的提示（冲突重试时把「N 秒后自动重试」带到新进程上，
+   *   否则重试期间界面只剩「正在启动」，用户看不出发生了什么）
+   */
+  spawnFrpc(pendingError = '') {
     const child = this.spawnImpl(this.exePath, ['-c', this.configPath], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     this.child = child;
-    this.state = { status: 'starting', url: this.state.url, error: '' };
+    this.state = { status: 'starting', url: this.state.url, error: pendingError };
     const onLine = (buffer) => {
       for (const line of buffer.toString('utf8').split(/\r?\n/)) {
         if (line.trim().length === 0) continue;
@@ -191,13 +216,49 @@ class FrpChannel {
       return;
     }
     if (parsed.event === 'proxy-fail') {
-      this.state = { ...this.state, error: `frpc 代理建立失败：${parsed.message ?? '未知原因'}` };
+      // 代理注册失败后 frpc 进程通常还活着（不会退出、不会重启），状态必须落到 error，
+      // 否则界面永远停在「正在启动」，用户看不到 already exists / port already used 这类原因。
+      const reason = parsed.message ?? '未知原因';
+      if (isConflictError(reason)) {
+        // 代理名/端口冲突是可自愈的：frps 要等旧连接心跳超时才释放（实测约 100 秒）。
+        // frpc 自己不重试，桥在这里线性退避重连，避免用户手动反复点「保存并切换」。
+        if (this.conflictRetries < this.maxConflictRetries) {
+          this.conflictRetries += 1;
+          const delay = this.conflictRetryBaseMs * this.conflictRetries;
+          const delayText = delay >= 1000 ? `${Math.round(delay / 1000)} 秒` : `${delay} 毫秒`;
+          this.state = {
+            status: 'starting',
+            url: '',
+            error: `frpc 代理名/端口被占用（${reason.slice(0, 120)}），`
+              + `${delayText}后自动重试（${this.conflictRetries}/${this.maxConflictRetries}）`,
+          };
+          this.log(this.state.error);
+          this.scheduleConflictRetry(delay, this.state.error);
+          return;
+        }
+        this.state = {
+          status: 'error',
+          url: '',
+          error: `frpc 代理名/端口持续被占用：${reason}。`
+            + '通常是另一台电脑仍在运行同一 frp 配置——请先在那台电脑停止该通道，'
+            + '或把本机的 remotePort 改成别的端口后重试',
+        };
+        return;
+      }
+      this.state = {
+        status: 'error',
+        url: '',
+        error: `frpc 代理建立失败：${reason}`,
+      };
       return;
     }
     if (parsed.event === 'proxy-start') {
       const remotePort = this.cfg.remotePort > 0 ? this.cfg.remotePort : parsed.remotePort;
       if (Number.isInteger(remotePort) && remotePort > 0) {
         const url = `http://${this.cfg.serverAddr}:${remotePort}`;
+        // 代理成功即视为本次连接健康：清零退避计数，避免长连接断开一次就顶到上限
+        this.restarts = 0;
+        this.conflictRetries = 0;
         this.state = { status: 'running', url, error: '' };
         this.log(`frp 通道就绪：${url}`);
       } else {
@@ -205,6 +266,29 @@ class FrpChannel {
         this.state = { ...this.state, status: 'starting' };
       }
     }
+  }
+
+  /**
+   * 代理冲突重试：先杀掉还活着的 frpc 进程，退避后再起一个。
+   * 与崩溃重启分开计时，避免冲突重试把崩溃计数顶到上限。
+   */
+  scheduleConflictRetry(delay, pendingError = '') {
+    if (this.restartTimer !== null) clearTimeout(this.restartTimer);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (this.stopping) return;
+      const child = this.child;
+      this.child = null;
+      if (child !== null) {
+        try {
+          child.kill();
+        } catch {
+          // 已经退出
+        }
+      }
+      this.spawnFrpc(pendingError);
+    }, delay);
+    if (typeof this.restartTimer.unref === 'function') this.restartTimer.unref();
   }
 
   scheduleRestart(code) {
@@ -266,6 +350,8 @@ export class TransportManager {
    *   fetchBuffer?: (url: string) => Promise<Buffer>,
    *   fetchMeta?: (url: string) => Promise<{ size: number, sha256?: string }>,
    *   backoffBaseMs?: number,
+   *   conflictRetryBaseMs?: number,
+   *   maxConflictRetries?: number,
    * }} deps
    */
   constructor(deps) {
@@ -278,6 +364,8 @@ export class TransportManager {
     this.fetchBuffer = deps.fetchBuffer;
     this.fetchMeta = deps.fetchMeta;
     this.backoffBaseMs = deps.backoffBaseMs;
+    this.conflictRetryBaseMs = deps.conflictRetryBaseMs;
+    this.maxConflictRetries = deps.maxConflictRetries;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.localPort = 0;
     this.switching = false;
@@ -431,6 +519,8 @@ export class TransportManager {
       ...(this.fetchJson !== undefined ? { fetchJson: this.fetchJson } : {}),
       ...(this.fetchBuffer !== undefined ? { fetchBuffer: this.fetchBuffer } : {}),
       ...(this.backoffBaseMs !== undefined ? { backoffBaseMs: this.backoffBaseMs } : {}),
+      ...(this.conflictRetryBaseMs !== undefined ? { conflictRetryBaseMs: this.conflictRetryBaseMs } : {}),
+      ...(this.maxConflictRetries !== undefined ? { maxConflictRetries: this.maxConflictRetries } : {}),
     });
     this.channel = channel;
     try {
