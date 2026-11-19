@@ -29,6 +29,7 @@ import { TransportManager, TUNNEL_MODES, normalizeTransportConfig } from './brid
 import { DshAdapter } from './adapter/dsh.js';
 import { lanAddress, pairHtml } from './pair.js';
 import { normalizeCloudflaredProtocol, normalizeCloudflaredDnsResolvers } from './cloudflare.js';
+import { DEFAULT_RELAY_ENDPOINT } from './bridge/relay.js';
 
 export const name = 'dsh-phone-bridge';
 export const version = BRIDGE_VERSION;
@@ -87,7 +88,13 @@ export function normalize(config) {
       staticDomain: typeof ngrok.staticDomain === 'string' ? ngrok.staticDomain : '',
     },
     relay: {
-      endpoint: typeof relay.endpoint === 'string' ? relay.endpoint : '',
+      // 中转服务是自建的（spec/relay.md），默认地址跟着官方服务走，可在配对页改。
+      endpoint: typeof relay.endpoint === 'string' && relay.endpoint.length > 0
+        ? relay.endpoint
+        : DEFAULT_RELAY_ENDPOINT,
+      token: typeof relay.token === 'string' ? relay.token : '',
+      // 8 位十六进制配对码：中转按它给隧道分组，手机端扫码时一并带上。
+      pairCode: typeof relay.pairCode === 'string' ? relay.pairCode : '',
     },
     logLevel: typeof raw.logLevel === 'string' ? raw.logLevel : 'info',
     tokenFile: typeof raw.tokenFile === 'string' ? raw.tokenFile : '',
@@ -192,6 +199,7 @@ export function apply(ctx, config) {
           if (typeof parsed.publicUrl === 'string') overrides.publicUrl = parsed.publicUrl;
           if (parsed.frp !== null && typeof parsed.frp === 'object') overrides.frp = parsed.frp;
           if (parsed.ngrok !== null && typeof parsed.ngrok === 'object') overrides.ngrok = parsed.ngrok;
+          if (parsed.relay !== null && typeof parsed.relay === 'object') overrides.relay = parsed.relay;
           transportOverrides = overrides;
         }
       }
@@ -208,7 +216,7 @@ export function apply(ctx, config) {
         // 浅合并：transport.json 里有的字段优先，缺的字段沿用插件 config
         frp: { ...(cfg.frp ?? {}), ...(transportOverrides.frp ?? {}) },
         ngrok: { ...(cfg.ngrok ?? {}), ...(transportOverrides.ngrok ?? {}) },
-        relay: cfg.relay,
+        relay: { ...(cfg.relay ?? {}), ...(transportOverrides.relay ?? {}) },
       }),
       home: defaultTokenHome(),
       log,
@@ -299,6 +307,7 @@ export function apply(ctx, config) {
             tunnelUrl: transportStatus.tunnelUrl,
             channels: transportStatus.channels,
             frp: transport.frpFormValues(),
+            relay: transport.relayFormValues(),
             currentChannel: transportStatus.tunnelMode,
             transportApiPath: '/api/transport/mode',
             localControlToken,

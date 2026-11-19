@@ -32,6 +32,7 @@ import {
   writeFrpcConfig,
 } from './frpc.js';
 import { NgrokChannel, ensureNgrokBinary, ngrokHomeDir } from './ngrok.js';
+import { RelayChannel, isValidPairCode, newPairCode, relayHttpBase, relayPublicUrl } from './relay.js';
 import { parsePublicUrl, probePublicUrl } from './public-endpoint.js';
 import { BridgeError, ErrorCode } from './errors.js';
 
@@ -83,6 +84,8 @@ export function normalizeTransportConfig(config) {
     },
     relay: {
       endpoint: typeof relay.endpoint === 'string' ? relay.endpoint.trim() : '',
+      token: typeof relay.token === 'string' ? relay.token.trim() : '',
+      pairCode: typeof relay.pairCode === 'string' ? relay.pairCode.trim() : '',
     },
   };
 }
@@ -103,6 +106,25 @@ function mergeSecretFields(previous, incoming) {
   return next;
 }
 
+/**
+ * 合并中转参数：token 与配对码在页面上不回显，留空即「保持原值」。
+ * 与 frp/ngrok 的 mergeSecretFields 同语义，但字段名不同（pairCode 不是密钥，却也不该被空值覆盖）。
+ */
+function mergeRelayParams(previous, incoming) {
+  const prev = previous !== null && typeof previous === 'object' ? previous : {};
+  const next = incoming !== null && typeof incoming === 'object' ? { ...incoming } : {};
+  if (typeof next.token !== 'string' || next.token.trim().length === 0) {
+    next.token = typeof prev.token === 'string' ? prev.token : '';
+  }
+  if (typeof next.pairCode !== 'string' || next.pairCode.trim().length === 0) {
+    next.pairCode = typeof prev.pairCode === 'string' ? prev.pairCode : '';
+  }
+  if (typeof next.endpoint !== 'string' || next.endpoint.trim().length === 0) {
+    next.endpoint = typeof prev.endpoint === 'string' ? prev.endpoint : '';
+  }
+  return next;
+}
+
 /** 通道卡片静态文案（选型建议按 contract §10 / §10.1）。 */
 export const CHANNEL_LABELS = {
   quick: { label: 'Cloudflare 快速隧道', desc: '免费试用，地址重启会变' },
@@ -110,7 +132,7 @@ export const CHANNEL_LABELS = {
   frp: { label: '标准 frp / 自建 frps', desc: '使用官方 frpc 连接标准 frps；服务商专用客户端请使用公网地址接入' },
   custom: { label: '服务商客户端 / 公网地址接入', desc: 'OpenFrp、樱花 Frp、NATAPP、cpolar、zrok 等官方客户端启动后，在此验证公网地址' },
   ngrok: { label: 'ngrok 官方（免费静态域名）', desc: '填 authtoken + 静态域名，桥自动托管 ngrok.exe' },
-  relay: { label: '商业中转（订阅）', desc: '下一阶段开放，敬请期待' },
+  relay: { label: '官方中转（无需服务器）', desc: '扫码即用；电脑自动连接我们的中转服务，无需公网 IP 或端口映射' },
   off: { label: '仅局域网', desc: '手机与电脑同一 Wi-Fi 时使用' },
 };
 
@@ -379,6 +401,14 @@ export class TransportManager {
    *   maxConflictRetries?: number,
    *   killImpl?: (exePath: string, options?: object) => number,
    *   bundledDir?: string,
+   *   WebSocketImpl?: Function,
+   *   fetchImpl?: (url: string, options?: object) => Promise<any>,
+   *   bridgeVersion?: string,
+   *   contractVersion?: number,
+   *   relayHeartbeatMs?: number,
+   *   relayReconnectBaseMs?: number,
+   *   relayMaxReconnects?: number,
+   *   onPairCodeChange?: (code: string) => void,
    * }} deps
    */
   constructor(deps) {
@@ -395,10 +425,32 @@ export class TransportManager {
     this.maxConflictRetries = deps.maxConflictRetries;
     this.killImpl = deps.killImpl;
     this.bundledDir = typeof deps.bundledDir === 'string' ? deps.bundledDir : undefined;
+    // 中转通道的可注入点（smoke-test 用假 WS / 假 fetch，不碰真实网络）
+    this.RelayChannelImpl = typeof deps.WebSocketImpl === 'function' ? deps.WebSocketImpl : undefined;
+    this.fetchImpl = typeof deps.fetchImpl === 'function' ? deps.fetchImpl : undefined;
+    this.bridgeVersion = typeof deps.bridgeVersion === 'string' ? deps.bridgeVersion : '';
+    this.contractVersion = Number.isInteger(deps.contractVersion) ? deps.contractVersion : 0;
+    this.relayHeartbeatMs = Number.isInteger(deps.relayHeartbeatMs) ? deps.relayHeartbeatMs : undefined;
+    this.relayReconnectBaseMs = Number.isInteger(deps.relayReconnectBaseMs) ? deps.relayReconnectBaseMs : undefined;
+    this.relayMaxReconnects = Number.isInteger(deps.relayMaxReconnects) ? deps.relayMaxReconnects : undefined;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
+    this.onPairCodeChange = typeof deps.onPairCodeChange === 'function' ? deps.onPairCodeChange : undefined;
     this.localPort = 0;
     this.switching = false;
     this.channel = null;      // 当前通道实例：统一有 snapshot()，进程型通道另有 stop()
+  }
+
+  /**
+   * 当前中转通道用于标记「这请求来自公网中转」的随机串。
+   *
+   * 桥的「仅本机接口」判定靠它识别中转流量：relay 转发进来的请求 socket 源是
+   * 127.0.0.1，与本机用户无法区分，只看 socket/Host 会把配对码接口暴露到公网。
+   * 通道没跑起来时返回空串，http 侧据此不做任何特殊处理。
+   */
+  relayMarker() {
+    const channel = this.channel;
+    if (channel === null || typeof channel !== 'object') return '';
+    return typeof channel.marker === 'string' ? channel.marker : '';
   }
 
   /** 端口就绪后由 index.js 调用（frp 需要真实桥端口做 localPort）。 */
@@ -444,13 +496,43 @@ export class TransportManager {
       return;
     }
     if (mode === 'relay') {
-      const endpoint = this.cfg.relay.endpoint;
-      this.channel = {
-        snapshot: () => endpoint.length > 0
-          ? { status: 'running', url: endpoint, error: '' }
-          : { status: 'reserved', url: '', error: '订阅中转服务下一阶段开放（本版仅占位展示）' },
-        stop: async () => {},
-      };
+      // 官方中转：电脑向我们的服务拨出长连接，手机按 8 位配对码拨入，
+      // 用户不需要公网 IP、端口映射或任何网络配置。
+      const channel = new RelayChannel({
+        endpoint: this.cfg.relay.endpoint,
+        token: this.cfg.relay.token,
+        pairCode: this.cfg.relay.pairCode,
+        localPort: this.localPort,
+        log: this.log,
+        bridgeVersion: this.bridgeVersion,
+        contractVersion: this.contractVersion,
+        ...(this.RelayChannelImpl !== undefined ? { WebSocketImpl: this.RelayChannelImpl } : {}),
+        ...(this.fetchImpl !== undefined ? { fetchImpl: this.fetchImpl } : {}),
+        ...(this.relayHeartbeatMs !== undefined ? { heartbeatMs: this.relayHeartbeatMs } : {}),
+        ...(this.relayReconnectBaseMs !== undefined ? { reconnectBaseMs: this.relayReconnectBaseMs } : {}),
+        ...(this.relayMaxReconnects !== undefined ? { maxReconnects: this.relayMaxReconnects } : {}),
+        // 配对码被中转服务判为占用时，通道会换一个码重试，这里同步回配置并持久化
+        onPairCodeChange: (code) => {
+          if (!isValidPairCode(code)) return;
+          this.cfg.relay.pairCode = code;
+          this.log(`中转配对码已更新：${code}`);
+          if (typeof this.onPairCodeChange === 'function') {
+            try {
+              this.onPairCodeChange(code);
+            } catch {
+              // 忽略持久化失败：内存里已经生效
+            }
+          }
+          this.notify();
+        },
+      });
+      this.channel = channel;
+      try {
+        await channel.start();
+      } catch (error) {
+        this.log(`中转通道启动失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.notify();
       return;
     }
     if (mode === 'ngrok') {
@@ -662,6 +744,23 @@ export class TransportManager {
         throw new BridgeError(ErrorCode.INVALID_PARAM, 'ngrok 缺少 authtoken；当前连接未改变');
       }
     }
+    if (mode === 'relay') {
+      // 中转不需要用户做任何网络配置；只校验「服务地址」「密钥」「配对码」三件套是否就位。
+      // 配对码留空时自动生成一个，用户不必手输——重置配对码也走这条路径。
+      const incoming = params?.relay;
+      const requestedRelay = normalizeTransportConfig({
+        relay: mergeRelayParams(this.cfg.relay, incoming),
+      }).relay;
+      if (requestedRelay.endpoint.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '中转服务地址不能为空；当前连接未改变');
+      }
+      if (requestedRelay.token.length === 0) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '中转密钥不能为空；当前连接未改变');
+      }
+      if (requestedRelay.pairCode.length > 0 && !isValidPairCode(requestedRelay.pairCode)) {
+        throw new BridgeError(ErrorCode.INVALID_PARAM, '中转配对码必须是 8 位小写字母或数字；当前连接未改变');
+      }
+    }
     if (params !== null) {
       if (typeof params.publicUrl === 'string') this.cfg.publicUrl = params.publicUrl.trim();
       // 表单留空的字段沿用已保存的值：token / authtoken 页面不回显，留空即「不修改」
@@ -671,6 +770,13 @@ export class TransportManager {
       if (params.ngrok !== null && typeof params.ngrok === 'object') {
         this.cfg.ngrok = normalizeTransportConfig({ ngrok: mergeSecretFields(this.cfg.ngrok, { ...this.cfg.ngrok, ...params.ngrok }) }).ngrok;
       }
+      if (params.relay !== null && typeof params.relay === 'object') {
+        this.cfg.relay = normalizeTransportConfig({ relay: mergeRelayParams(this.cfg.relay, params.relay) }).relay;
+      }
+    }
+    // 配对码为空时生成一个：用户只要点「开启中转」，不必自己编一串码
+    if (mode === 'relay' && this.cfg.relay.pairCode.length === 0) {
+      this.cfg.relay.pairCode = newPairCode();
     }
     if (publicUrl !== undefined) this.cfg.publicUrl = publicUrl;
     this.log(`切换公网通道：${this.cfg.tunnelMode} → ${mode}`);
@@ -686,6 +792,7 @@ export class TransportManager {
           publicUrl: this.cfg.publicUrl,
           frp: this.cfg.frp,
           ngrok: this.cfg.ngrok,
+          relay: this.cfg.relay,
         };
         fs.writeFileSync(persistFile, `${JSON.stringify(persistPayload, null, 2)}\n`, 'utf8');
         try {
@@ -714,7 +821,15 @@ export class TransportManager {
       frp: { id: 'frp', ...CHANNEL_LABELS.frp, status: 'off', url: '', error: '', binary: 'none', restarts: 0 },
       custom: { id: 'custom', ...CHANNEL_LABELS.custom, status: 'off', url: this.cfg.publicUrl, error: '' },
       ngrok: { id: 'ngrok', ...CHANNEL_LABELS.ngrok, status: 'off', url: '', error: '', binary: 'none', restarts: 0 },
-      relay: { id: 'relay', ...CHANNEL_LABELS.relay, status: 'reserved', url: this.cfg.relay.endpoint, error: '' },
+      relay: {
+        id: 'relay',
+        ...CHANNEL_LABELS.relay,
+        status: 'off',
+        // 不回显密钥：只暴露手机要填的 http(s) 地址（不是 ws://，手机直接粘贴这个）
+        url: relayPublicUrl(this.cfg.relay.endpoint, this.cfg.relay.pairCode),
+        error: '',
+        pairCode: this.cfg.relay.pairCode,
+      },
     };
     let tunnelStatus = 'off';
     let tunnelUrl = '';
@@ -751,6 +866,15 @@ export class TransportManager {
       remotePort: this.cfg.frp.remotePort,
       useTls: this.cfg.frp.useTls,
       hasToken: this.cfg.frp.token.length > 0,
+    };
+  }
+
+  /** 配对页 relay 表单回显值：同样不回显 token，只给 endpoint 与 hasToken。 */
+  relayFormValues() {
+    return {
+      endpoint: this.cfg.relay.endpoint,
+      pairCode: this.cfg.relay.pairCode,
+      hasToken: this.cfg.relay.token.length > 0,
     };
   }
 

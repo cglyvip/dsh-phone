@@ -1,4 +1,37 @@
-﻿# CHANGELOG
+﻿## 3.8.0（2026-11-20）
+
+### 新增：官方中转通道（用户零网络配置）
+
+商业软件不能让用户自备 VPS、配 frps、改路由器。这条通道让电脑**主动向中转服务
+拨出一条 WSS 长连接**，手机也从同一服务拨入，两端靠 8 位配对码在服务端会合。
+
+- 配对页新增「官方中转（无需服务器）」卡片：填一次中转密钥，点一下开关就能用
+- 首次开启自动生成 8 位配对码，配对页直接显示「手机端填：https://…/p/<码>」
+- 配对码被占用时自动换码重试（最多 3 次），并把新码同步回 transport.json
+- 注册成功后断线会**无限重连**（退避间隔封顶 60 秒），网络抖动不会永久掉线
+- 一条中转连接多路复用：HTTP 用 requestId、WebSocket 用 connId 区分并发请求
+- HTTP 响应全程按字节流式转发，图片/视频/流式回复不被缓冲打断
+
+### 安全
+
+- **修掉一个会泄露配对码的洞**：中转转发到本机桥的请求 socket 源是 127.0.0.1，
+  原本会被「仅本机接口」判定当成本机用户放行，导致 `/api/pairing-code`、
+  `/pair` 可经公网访问。现在每个请求带一个每次启动随机生成的 `x-dsh-relay`
+  标记头，`bridge/http.js` 用定长比较识别并拒绝
+- 中转请求的来源 IP 取自 nginx 的 `x-real-ip` → `x-forwarded-for`，
+  配对防爆破不再让所有中转用户共用 127.0.0.1 一个计数器
+
+### 其它
+
+- 中转密钥只落 `transport.json`（600），任何 HTTP 响应与页面都不回显
+- `relay-probe.mjs` 联调探针改为从环境变量读密钥，不再把密钥写进仓库
+
+### 测试
+
+- 冒烟测试 79 项：新增 relay 通道的离线全链路（注册 / HTTP 转发 / WS 双向 /
+  标记头 / 换码重试 / 地址规范化），全程假 WS + 假 fetch，不碰真实网络
+
+# CHANGELOG
 
 ## 3.7.3（2026-11-17）
 
@@ -501,7 +534,8 @@ Refusing to move or copy a tree containing a junction or symbolic link:
 - **归档箱不生效**：GET /api/sessions?archived=1 与主列表返回完全相同的集合。
   根因：SessionSummary 上不带归档 / 置顶字段，旧实现只是把 rchived 原样回显。
   修法：DshAdapter.startWorkspaceWatch() 订阅 workspaceController.follow()，
-  用 baseline 与 rchived / pinned / eplace 增量维护 rchivedIds / pinnedIds 集合；
+  用 baseline 与 rchived / pinned / 
+eplace 增量维护 rchivedIds / pinnedIds 集合；
   listSessions(archived) 据此过滤，并给每条记录补 rchived / pinned 两个字段；
   置顶会话排最前，其次运行中，再按 updatedAt 倒序。
 - **DELETE 语义澄清**：DSH 没有「彻底删除会话」的接口，DELETE /api/sessions/:id

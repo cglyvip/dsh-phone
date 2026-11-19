@@ -321,6 +321,7 @@ node --test tools/test-cloudflare-startup.mjs tools/test-transport-startup.mjs t
 - v3.7.1：frp 代理名冲突可识别并自动退避重连（不再卡在「正在启动」）
 - v3.7.2：frp 代理名按本机唯一化 + 启动前清理遗留 frpc，多台电脑连同一台 frps 不再撞名
 - v3.7.3：安装脚本兼容 npm 在包内生成的自引用链接（新版本 npm 下安装不再被拦）
+- v3.8.0：官方中转通道，用户不用买 VPS / 配 frps，填个配对码手机就能连上电脑
 
 ---
 

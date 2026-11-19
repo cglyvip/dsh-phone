@@ -26,6 +26,7 @@ import {
 import send from 'send';
 import { timingSafeEqual } from 'node:crypto';
 import { probePublicUrl, TUNNEL_MODES } from './transport.js';
+import { RELAY_MARKER_HEADER } from './relay.js';
 
 /**
  * 隧道流量的 Host 头标记（与 cloudflare.js 的 TUNNEL_HOST_HEADER 一致）。
@@ -64,6 +65,45 @@ function matchRoute(routes, method, pathname) {
  */
 export function createHttpHandler(deps) {
   const { adapter, eventHub, tokens, pairing, transport, transportPersistFile, localControlToken, config, log } = deps;
+
+  /**
+   * 取当前中转通道的标记串。relay 转发到本机桥的请求 socket 源是 127.0.0.1，
+   * 与本机用户无法区分；靠这个随机串（每次启动生成、不经网络传输）识别来源。
+   */
+  function relayMarker() {
+    if (transport === undefined || transport === null) return '';
+    if (typeof transport.relayMarker !== 'function') return '';
+    const marker = transport.relayMarker();
+    return typeof marker === 'string' ? marker : '';
+  }
+
+  /**
+   * 判断请求是否由中转通道转发进来。
+   *
+   * 标记串是 32 字节随机的 base64url，只存在于本进程与转发头里，外部猜不到；
+   * 用定长比较避免时序侧信道。值对不上就当作普通请求，不做任何特殊处理。
+   */
+  function isRelayRequest(request) {
+    const value = request.headers[RELAY_MARKER_HEADER];
+    if (typeof value !== 'string' || value.length === 0) return false;
+    const expected = relayMarker();
+    if (expected.length === 0) return false;
+    const actual = Buffer.from(value, 'utf8');
+    const wanted = Buffer.from(expected, 'utf8');
+    return actual.length === wanted.length && timingSafeEqual(actual, wanted);
+  }
+
+  /** 请求的真实来源 IP：中转请求带 x-forwarded-for（由中转服务从 nginx 的 x-real-ip 传入）。 */
+  function requestIp(request) {
+    if (isRelayRequest(request)) {
+      const forwarded = request.headers['x-forwarded-for'];
+      if (typeof forwarded === 'string' && forwarded.length > 0) {
+        const first = forwarded.split(',')[0].trim();
+        if (first.length > 0) return first;
+      }
+    }
+    return clientIp(request);
+  }
 
   const routes = [
     { method: 'GET', pattern: /^\/api\/health$/, handler: handleHealth },
@@ -576,12 +616,16 @@ export function createHttpHandler(deps) {
 
     try {
       if (route.loopbackOnly === true) {
-        // 公网通道（cloudflared 快速/命名隧道、frp tcp 透传）的请求都从 127.0.0.1 连入，
-        // socket 层面与本机用户无法区分：
+        // 公网通道（cloudflared 快速/命名隧道、frp tcp 透传、官方中转）的请求都从
+        // 127.0.0.1 连入，socket 层面与本机用户无法区分：
+        //   - 官方中转：请求带 x-dsh-relay 标记头 → 显式拒绝
         //   - quick 隧道：Host 被改写成 dsh-phone-bridge-tunnel → 显式拒绝
         //   - frp tcp：Host 是 vps:remotePort → 非 Host 回环 → 拒绝
         //   - 本机用户：Host 是 127.0.0.1[:port]/localhost[:port] → 放行
         // 业务接口不受影响（各通道 + LAN 的 Bearer 请求全部正常放行）。
+        if (isRelayRequest(request)) {
+          throw new BridgeError(ErrorCode.ROUTE_LOCAL_ONLY, '该接口不允许通过公网中转访问');
+        }
         if (isTunnelRequest(request)) {
           throw new BridgeError(ErrorCode.ROUTE_LOCAL_ONLY, '该接口不允许通过公网隧道访问');
         }

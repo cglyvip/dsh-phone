@@ -68,6 +68,8 @@ export function pairHtml(info) {
   const channels = info.channels !== null && typeof info.channels === 'object' ? info.channels : {};
   // frp 通道参数（回显 serverAddr/serverPort/remotePort 便于换机修改；token 只回「是否已保存」）
   const frpConfig = info.frp !== null && typeof info.frp === 'object' ? info.frp : {};
+  // 中转通道参数（只回显地址与配对码；密钥只回「是否已保存」）
+  const relayConfig = info.relay !== null && typeof info.relay === 'object' ? info.relay : {};
   const currentChannel = typeof info.currentChannel === 'string' ? info.currentChannel : 'off';
   const transportApiPath = typeof info.transportApiPath === 'string' ? info.transportApiPath : '/api/transport/mode';
   const localControlToken = typeof info.localControlToken === 'string' ? info.localControlToken : '';
@@ -198,8 +200,26 @@ export function pairHtml(info) {
         <div class="ch-desc">切换后桥自动下载托管 ngrok.exe（用户手放 ~/.dsh/phone-bridge/ngrok/ 优先）；authtoken 只落 transport.json，不回显。</div>
       </div>`;
     }
-    // 带表单的卡片（frp/custom/ngrok）按钮由表单自己渲染，避免出现两个切换按钮
-    const switchButton = (id === 'frp' || id === 'custom' || id === 'ngrok' || id === 'named')
+    if (id === 'relay') {
+      const relayCfg = relayConfig !== null && typeof relayConfig === 'object' ? relayConfig : {};
+      const relayEndpoint = typeof relayCfg.endpoint === 'string' ? relayCfg.endpoint : '';
+      const relayHasSecret = relayCfg.hasToken === true;
+      const relayPairCode = typeof relayCfg.pairCode === 'string' ? relayCfg.pairCode : '';
+      // 手机要填的是 http(s) 地址，不是 ws://：把端点转成手机能直接粘贴的形式
+      const relayPhoneUrl = relayEndpoint.length > 0 && relayPairCode.length === 8
+        ? `${relayEndpoint.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')}/p/${relayPairCode}`
+        : '';
+      extra = `
+      <div class="ch-form">
+        <input id="relay-endpoint" class="ch-input" type="text" placeholder="中转地址（默认已填官方服务，留空则用默认值）" autocomplete="off" value="${escapeHtml(relayEndpoint)}">
+        <input id="relay-secret" class="ch-input" type="password" placeholder="${relayHasSecret ? '中转密钥已保存，留空则不修改' : '中转密钥（由服务方提供，填一次即可）'}" autocomplete="off">
+        <button class="ch-btn" data-mode="relay" data-relay="1">保存并开启中转</button>
+        ${relayPhoneUrl.length > 0 ? `<div class="ch-url">手机端填：${escapeHtml(relayPhoneUrl)}</div>` : ''}
+        <div class="ch-desc">不用买服务器、不用改路由器：电脑主动连中转，手机也连中转，两边按配对码会合。${relayPairCode.length === 8 ? `当前配对码 <b>${escapeHtml(relayPairCode)}</b>（手机端输入它即可）。` : '首次开启会自动生成配对码。'}</div>
+      </div>`;
+    }
+    // 带表单的卡片（frp/custom/ngrok/relay）按钮由表单自己渲染，避免出现两个切换按钮
+    const switchButton = (id === 'frp' || id === 'custom' || id === 'ngrok' || id === 'named' || id === 'relay')
       ? ''
       : `${active ? '' : `<button class="ch-btn" data-mode="${id}"${channel.status === 'reserved' ? ' disabled' : ''}>切换到此通道</button>`}`;
     return `
@@ -451,6 +471,16 @@ export function pairHtml(info) {
         if (authtokenInput && authtokenInput.value.trim().length > 0) ngrokParams.authtoken = authtokenInput.value.trim();
         if (domainInput && domainInput.value.trim().length > 0) ngrokParams.staticDomain = domainInput.value.trim();
         payload.ngrok = ngrokParams;
+      }
+      if (btn.getAttribute('data-relay') === '1') {
+        const endpointInput = document.getElementById('relay-endpoint');
+        const secretInput = document.getElementById('relay-secret');
+        const relayParams = {};
+        // 留空 = 用默认官方地址（桥端会自动补默认值）
+        if (endpointInput && endpointInput.value.trim().length > 0) relayParams.endpoint = endpointInput.value.trim();
+        // 留空 = 沿用已保存的密钥（页面不回显）
+        if (secretInput && secretInput.value.trim().length > 0) relayParams.token = secretInput.value.trim();
+        payload.relay = relayParams;
       }
       btn.disabled = true;
       btn.textContent = '切换中…';

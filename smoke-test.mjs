@@ -26,6 +26,7 @@ import { BRIDGE_VERSION } from './shared/version.js';
 import { FRP_PROVIDERS, pairHtml } from './pair.js';
 import { TUNNEL_PROVIDERS } from './shared/tunnel-providers.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
+import { RelayChannel, RELAY_MARKER_HEADER, normalizeEndpoint } from './bridge/relay.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
@@ -129,6 +130,198 @@ async function waitForCondition(getValue, expect, timeoutMs = 8000, label = '条
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+/**
+ * 官方中转通道的离线测试：用假 WS + 假 fetch 驱动 RelayChannel，
+ * 覆盖注册、HTTP 转发、WS 双向转发、标记头、换码重试、地址规范化。
+ * 全程不碰真实网络。
+ */
+async function runRelayScenarios() {
+  const result = {
+    registered: false,
+    rolesBridge: false,
+    httpOk: false,
+    markerSent: false,
+    wsForwarded: false,
+    codeRetried: false,
+    codePersisted: false,
+    urlIsHttp: false,
+    endpointNormalized: false,
+  };
+
+  /** 假 WebSocket：记录所有实例，测试可主动模拟「服务端下发」。 */
+  const instances = [];
+  class FakeWebSocket {
+    constructor(url, options) {
+      this.url = url;
+      this.options = options ?? {};
+      this.readyState = 0;
+      this.sent = [];
+      this.handlers = new Map();
+      this.closed = false;
+      instances.push(this);
+      queueMicrotask(() => {
+        if (this.closed) return;
+        this.readyState = 1;
+        this.emit('open');
+      });
+    }
+    on(event, fn) {
+      const list = this.handlers.get(event) ?? [];
+      list.push(fn);
+      this.handlers.set(event, list);
+      return this;
+    }
+    emit(event, ...args) {
+      for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args);
+    }
+    send(data) {
+      this.sent.push(data);
+    }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      queueMicrotask(() => this.emit('close', 1000, Buffer.from('')));
+    }
+    /** 模拟服务端下发一帧文本（自动 JSON 序列化）。 */
+    deliver(frame) {
+      this.emit('message', Buffer.from(JSON.stringify(frame), 'utf8'), false);
+    }
+    /** 已发出的文本帧（解析成对象），用于断言协议内容。 */
+    frames() {
+      return this.sent
+        .filter((item) => typeof item === 'string')
+        .map((item) => JSON.parse(item));
+    }
+  }
+
+  const fetchCalls = [];
+  const fetchImpl = async (url, options = {}) => {
+    fetchCalls.push({ url, options });
+    return new Response(JSON.stringify({ status: 'ok' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'x-bridge': 'test' },
+    });
+  };
+
+  // ── 场景 A：正常注册 → HTTP 转发 → WS 双向转发 ──
+  const channel = new RelayChannel({
+    endpoint: 'https://relay.example.com',
+    token: 'test-token',
+    pairCode: 'a1b2c3d4',
+    localPort: 8787,
+    WebSocketImpl: FakeWebSocket,
+    fetchImpl,
+    heartbeatMs: 60_000,
+    reconnectBaseMs: 10,
+    bridgeVersion: '3.7.4',
+    contractVersion: 3,
+  });
+  const startPromise = channel.start();
+  await waitForCondition(() => instances.length, (n) => n > 0, 1000, 'relay WS 实例');
+  const relayWs = instances[0];
+  // 端点规范化：用户填 https，内部必须是 wss
+  if (relayWs.url === 'wss://relay.example.com/bridge') result.endpointNormalized = true;
+
+  await waitForCondition(() => relayWs.frames().length, (n) => n > 0, 1000, 'register 帧');
+  const register = relayWs.frames()[0];
+  result.registered = register.type === 'register' && register.pairCode === 'a1b2c3d4';
+  result.rolesBridge = register.role === 'bridge';
+
+  relayWs.deliver({ type: 'registered', pairCode: 'a1b2c3d4' });
+  await startPromise;
+  const snap = channel.snapshot();
+  result.urlIsHttp = snap.status === 'running'
+    && snap.url === 'https://relay.example.com/p/a1b2c3d4';
+
+  // HTTP 转发：手机请求 → 本机桥（必须带标记头、丢掉 host）
+  relayWs.deliver({
+    type: 'req',
+    requestId: 'r1',
+    method: 'GET',
+    path: '/api/health',
+    headers: { authorization: 'Bearer dsb_x', host: 'should-be-dropped' },
+    bodyLength: 0,
+  });
+  await waitForCondition(
+    () => relayWs.frames(),
+    (frames) => frames.some((frame) => frame.type === 'res' && frame.end === true),
+    2000,
+    'HTTP 响应帧',
+  );
+  const fetchCall = fetchCalls[0];
+  if (fetchCall !== undefined && fetchCall.url === 'http://127.0.0.1:8787/api/health') {
+    result.httpOk = true;
+    const sentHeaders = fetchCall.options.headers ?? {};
+    result.markerSent = sentHeaders[RELAY_MARKER_HEADER] === channel.marker
+      && sentHeaders.host === undefined;
+  }
+
+  // WS 转发：手机连入 → 本机开一条带标记头的 WS，双向透传
+  relayWs.deliver({ type: 'ws-open', connId: 'w1', path: '/ws', search: '?token=abc' });
+  await waitForCondition(() => instances.length, (n) => n > 1, 1000, '本机 WS 实例');
+  const localWs = instances[1];
+  const localOk = localWs.url === 'ws://127.0.0.1:8787/ws?token=abc'
+    && localWs.options.headers?.[RELAY_MARKER_HEADER] === channel.marker;
+  relayWs.deliver({
+    type: 'ws-in',
+    connId: 'w1',
+    payload: Buffer.from('ping').toString('base64'),
+    binary: false,
+  });
+  const gotPhoneFrame = localWs.sent.includes('ping');
+  localWs.emit('message', Buffer.from('pong'), false);
+  const gotBack = relayWs.frames().some((frame) => frame.type === 'ws-out' && frame.connId === 'w1');
+  if (localOk && gotPhoneFrame && gotBack) result.wsForwarded = true;
+
+  await channel.stop();
+
+  // ── 场景 B：配对码被占用 → 自动换码重试并回调上层持久化 ──
+  let persistedCode = '';
+  const channel2 = new RelayChannel({
+    endpoint: 'wss://relay.example.com',
+    token: 'test-token',
+    pairCode: 'a1b2c3d4',
+    localPort: 8787,
+    WebSocketImpl: FakeWebSocket,
+    fetchImpl,
+    heartbeatMs: 60_000,
+    reconnectBaseMs: 10,
+    onPairCodeChange: (code) => { persistedCode = code; },
+  });
+  const before = instances.length;
+  const start2 = channel2.start();
+  await waitForCondition(() => instances.length, (n) => n > before, 1000, '第二个 relay WS');
+  const relayWs2 = instances[before];
+  await waitForCondition(() => relayWs2.frames().length, (n) => n > 0, 1000, '第二次 register');
+
+  relayWs2.deliver({ type: 'error', code: 'CODE_TAKEN' });
+  await waitForCondition(() => instances.length, (n) => n > before + 1, 3000, '换码后的 relay WS');
+  const relayWs3 = instances[before + 1];
+  await waitForCondition(() => relayWs3.frames().length, (n) => n > 0, 3000, '换码后的 register');
+  const secondRegister = relayWs3.frames()[0];
+  const newCode = secondRegister.pairCode;
+  if (secondRegister.type === 'register'
+    && typeof newCode === 'string'
+    && newCode !== 'a1b2c3d4'
+    && /^[a-z0-9]{8}$/.test(newCode)) {
+    result.codeRetried = true;
+  }
+  if (persistedCode.length === 8 && persistedCode === newCode) result.codePersisted = true;
+
+  relayWs3.deliver({ type: 'registered', pairCode: newCode });
+  await start2;
+  await channel2.stop();
+
+  // ── 场景 C：纯函数级的地址规范化 ──
+  result.endpointNormalized = result.endpointNormalized
+    && normalizeEndpoint('http://1.2.3.4:8080/') === 'ws://1.2.3.4:8080'
+    && normalizeEndpoint('ftp://x') === '';
+
+  return result;
+}
+
 
 // ── 假 DSH 服务 ────────────────────────────────────────────────────────────
 
@@ -1844,16 +2037,30 @@ async function main() {
   assert.ok(namedError.tunnelError.includes('publicUrl'), '缺 publicUrl 应给出可读错误');
   assert.equal(namedError.channels.frp.status, 'off', '其它通道不受影响');
   await transportH.stop();
-  // relay 占位
+  // relay：缺密钥/缺地址时必须给出可读错误，不能静默失败
   const transportI = new TransportManager({
-    config: normalizeTransportConfig({ tunnelMode: 'relay', relay: { endpoint: '' } }),
+    config: normalizeTransportConfig({ tunnelMode: 'relay', relay: { endpoint: '', token: '', pairCode: 'a1b2c3d4' } }),
     home: frpcHomeE,
     log: frpLog,
   });
   await transportI.start({ localPort: 8787 });
-  assert.equal(transportI.status().tunnelStatus, 'reserved', 'relay 本期仅占位展示');
+  assert.equal(transportI.status().tunnelStatus, 'error', 'relay 缺地址应报错');
+  assert.ok(transportI.status().tunnelError.includes('中转'), 'relay 缺地址错误应可读');
   await transportI.stop();
-  pass('named 缺 publicUrl 报错降级 / relay 占位展示');
+  pass('named 缺 publicUrl 报错降级 / relay 缺参数给出可读错误');
+
+  // 27c) 官方中转：完整通道行为（假 WS / 假 fetch，不碰真实网络）
+  const relayScenarios = await runRelayScenarios();
+  assert.equal(relayScenarios.registered, true, 'relay 应发出 register 帧');
+  assert.equal(relayScenarios.rolesBridge, true, 'register 帧必须带 role=bridge');
+  assert.equal(relayScenarios.httpOk, true, 'relay 应把手机 HTTP 请求转发到本机桥');
+  assert.equal(relayScenarios.markerSent, true, '转发到本机桥的请求必须带 x-dsh-relay 标记头');
+  assert.equal(relayScenarios.wsForwarded, true, 'relay 应把手机 WS 帧转发到本机桥');
+  assert.equal(relayScenarios.codeRetried, true, '配对码被占用时应换码重试');
+  assert.equal(relayScenarios.codePersisted, true, '换码后应回调上层持久化');
+  assert.equal(relayScenarios.urlIsHttp, true, '对外地址必须是 http(s) 形式（手机直接粘贴）');
+  assert.equal(relayScenarios.endpointNormalized, true, 'https 端点应被规范成 wss');
+  pass('官方中转通道（注册 / HTTP 转发 / WS 转发 / 标记头 / 换码重试 / 地址规范化）');
 
   // 28) v3.2 §10：HTTP 通道路由（GET /api/transport + POST /api/transport/mode）
   const transportGet = await request(port, 'GET', '/api/transport', { token });
