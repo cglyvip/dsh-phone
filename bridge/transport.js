@@ -156,6 +156,8 @@ class FrpChannel {
     this.configPath = '';
     // 孤儿进程清理可注入（smoke-test 不真的去杀系统进程）
     this.killImpl = typeof options.killImpl === 'function' ? options.killImpl : killOrphanFrpc;
+    // 内置 frpc 目录可注入（smoke-test 隔离仓库里的大二进制，走"用户手放"分支）
+    this.bundledDir = typeof options.bundledDir === 'string' ? options.bundledDir : undefined;
     this.stopping = false;
     this.restarts = 0;
     this.conflictRetries = 0;
@@ -176,6 +178,7 @@ class FrpChannel {
       log: this.log,
       ...(this.fetchJson !== undefined ? { fetchJson: this.fetchJson } : {}),
       ...(this.fetchBuffer !== undefined ? { fetchBuffer: this.fetchBuffer } : {}),
+      ...(this.bundledDir !== undefined ? { bundledDir: this.bundledDir } : {}),
     });
     this.exePath = exePath;
     this.binary = source;
@@ -375,6 +378,7 @@ export class TransportManager {
    *   conflictRetryBaseMs?: number,
    *   maxConflictRetries?: number,
    *   killImpl?: (exePath: string, options?: object) => number,
+   *   bundledDir?: string,
    * }} deps
    */
   constructor(deps) {
@@ -390,6 +394,7 @@ export class TransportManager {
     this.conflictRetryBaseMs = deps.conflictRetryBaseMs;
     this.maxConflictRetries = deps.maxConflictRetries;
     this.killImpl = deps.killImpl;
+    this.bundledDir = typeof deps.bundledDir === 'string' ? deps.bundledDir : undefined;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.localPort = 0;
     this.switching = false;
@@ -565,6 +570,7 @@ export class TransportManager {
       ...(this.conflictRetryBaseMs !== undefined ? { conflictRetryBaseMs: this.conflictRetryBaseMs } : {}),
       ...(this.maxConflictRetries !== undefined ? { maxConflictRetries: this.maxConflictRetries } : {}),
       ...(this.killImpl !== undefined ? { killImpl: this.killImpl } : {}),
+      ...(this.bundledDir !== undefined ? { bundledDir: this.bundledDir } : {}),
     });
     this.channel = channel;
     try {

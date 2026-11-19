@@ -1753,10 +1753,13 @@ async function main() {
     spawnImpl: orphanSpawner.spawnImpl,
     killImpl,
     backoffBaseMs: 20,
+    // 指到空目录：隔离仓库内置的 frpc，才能测到"用户手放"这条路径
+    bundledDir: join(frpcHomeE, 'no-bundled'),
   });
   await transportF4.start({ localPort: 8787 });
   assert.equal(orphanCalls.length, 1, '启动前必须清理一次遗留 frpc 进程');
-  assert.ok(orphanCalls[0].exePath.endsWith('frpc.exe'), `清理目标应是本机托管的 frpc.exe（实际：${orphanCalls[0].exePath}）`);
+  assert.equal(orphanCalls[0].exePath, join(frpcHomeE, 'phone-bridge', 'frpc', 'frpc.exe'),
+    `清理目标应是本次选中的 frpc 二进制（实际：${orphanCalls[0].exePath}）`);
   assert.ok(orphanCalls[0].hasLog, '清理应能记录日志');
   assert.equal(orphanSpawner.spawns.length, 1, '清理后照常拉起新进程');
   await transportF4.stop();
