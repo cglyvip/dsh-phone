@@ -1,7 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
+    # 本地仓库路径（默认：本脚本所在仓库的根目录），
+    # 或 Git 地址 / GitHub 简写（cglyvip/dsh-phone-bridge），此时先浅克隆再安装。
     [string]$Source = (Split-Path -Parent $PSScriptRoot),
-    [string]$ProfileRoot = ''
+    [string]$ProfileRoot = '',
+    [string]$Ref = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,6 +89,59 @@ if ($LASTEXITCODE -ne 0 -or [int]$nodeVersion.Split('.')[0] -lt 20) {
     throw 'Install Node.js 20 or later before installing this plugin.'
 }
 
+# ── 来源解析：本地目录 / Git 地址 / GitHub 简写 都支持 ──────────────────────
+# 用户想「直接从 GitHub 安装」时不必先 clone：
+#   .\install-local.ps1 -Source cglyvip/dsh-phone-bridge
+#   .\install-local.ps1 -Source https://github.com/cglyvip/dsh-phone-bridge.git -Ref main
+$gitCommand = $null
+$temporaryClone = $null
+$isRemoteSource = $false
+# 必须先看本地目录是否存在：相对路径如 doc/sub 也符合 GitHub 简写格式，
+# 若先按正则判断，本地相对路径会被误当成远端仓库去克隆。
+if (Test-Path -LiteralPath $Source -PathType Container) {
+    $isRemoteSource = $false
+} elseif ($Source -match '^(https?://|git@|ssh://)' -or $Source -match '^[\w.-]+/[\w.-]+$') {
+    $isRemoteSource = $true
+} else {
+    throw "Source does not exist: $Source（本地路径不存在，也不是 Git 地址）"
+}
+
+if ($isRemoteSource) {
+    $gitCommand = (Get-Command git.exe -ErrorAction SilentlyContinue).Source
+    if ($null -eq $gitCommand) {
+        $gitCommand = (Get-Command git -ErrorAction SilentlyContinue).Source
+    }
+    if ([string]::IsNullOrWhiteSpace($gitCommand)) {
+        throw '从 GitHub 安装需要先安装 Git（https://git-scm.com/download/win），或改用 -Source <本地仓库路径>。'
+    }
+    $cloneUrl = if ($Source -match '^[\w.-]+/[\w.-]+$') {
+        'https://github.com/' + $Source + '.git'
+    } else {
+        $Source
+    }
+    $temporaryClone = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-phone-bridge-src-' + [guid]::NewGuid().ToString('N'))
+    Write-Output ('Cloning ' + $cloneUrl + ' ...')
+    $cloneArgs = @('clone', '--depth', '1')
+    if (-not [string]::IsNullOrWhiteSpace($Ref)) {
+        $cloneArgs += @('--branch', $Ref)
+    }
+    $cloneArgs += @($cloneUrl, $temporaryClone)
+    & $gitCommand @cloneArgs
+    if ($LASTEXITCODE -ne 0) {
+        # git 通常已自行清理失败目录，这里再兜底一次，避免依赖 git 的行为
+        if (Test-Path -LiteralPath $temporaryClone) {
+            try {
+                Remove-Item -LiteralPath $temporaryClone -Recurse -Force -ErrorAction SilentlyContinue
+            } catch {
+                # 清理失败不覆盖原始错误
+            }
+        }
+        throw 'git clone failed. Check the network and the repository address.'
+    }
+    $Source = $temporaryClone
+}
+
+try {
 $sourceRoot = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path
 $sourceManifestPath = Join-Path $sourceRoot 'package.json'
 $sourceManifest = Read-JsonFile -Path $sourceManifestPath
@@ -236,3 +292,14 @@ Write-Output ('Profile backup: ' + $profileManifestPath + $backupSuffix)
 Write-Output ('Isolated installation files: ' + $stagingDirectory)
 Write-Output 'Exit DSH completely from its system tray, then start it again.'
 Write-Output 'On this computer, open http://127.0.0.1:9000/api/health and http://127.0.0.1:9000/pair.'
+}
+finally {
+    # 远程来源的临时克隆用完即删；本地来源不动用户仓库
+    if ($null -ne $temporaryClone -and (Test-Path -LiteralPath $temporaryClone)) {
+        try {
+            Remove-Item -LiteralPath $temporaryClone -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            # 清理失败不影响安装结果
+        }
+    }
+}

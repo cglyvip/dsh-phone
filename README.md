@@ -61,6 +61,23 @@ Set-Location .\dsh-phone-bridge
 .\tools\install-local.ps1
 ```
 
+也可以不先 clone，直接从 GitHub 安装（脚本会浅克隆到临时目录，装完即删）：
+
+```powershell
+# GitHub 简写
+.\tools\install-local.ps1 -Source cglyvip/dsh-phone-bridge
+
+# 完整 Git 地址 + 指定分支或 tag
+.\tools\install-local.ps1 -Source https://github.com/cglyvip/dsh-phone-bridge.git -Ref main
+
+# 私有仓库（走 SSH）
+.\tools\install-local.ps1 -Source git@github.com:cglyvip/dsh-phone-bridge.git
+```
+
+`-Source` 的判断顺序是「先看本地是否存在同名目录，不存在才当 Git 地址」，
+所以传相对路径不会误触远程克隆。远程安装需要电脑已装 Git；临时克隆目录在安装结束
+（无论成功失败）后自动删除，不会改动任何本地仓库。
+
 下载代码不等于已经安装插件，必须执行安装脚本。脚本使用 `npm pack` 的发布文件白名单打包，
 在独立临时目录用 `npm install` 安装运行依赖，再只替换 `node_modules/dsh-phone-bridge`。
 依赖保留在插件自己的 `node_modules` 中，不在整个 desktop profile 上运行 npm，
