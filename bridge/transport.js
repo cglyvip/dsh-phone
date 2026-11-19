@@ -16,7 +16,13 @@
  * 依赖注入（spawn/fetch/timer/quickStarter）全部可替换，smoke-test 用 mock 进程覆盖。
  */
 import { spawn } from 'node:child_process';
-import { startQuickTunnel, normalizeCloudflaredProtocol, normalizeCloudflaredDnsResolvers } from '../cloudflare.js';
+import {
+  startQuickTunnel,
+  normalizeCloudflaredProtocol,
+  normalizeCloudflaredDnsResolvers,
+  cloudflaredHomeDir,
+  ensureCloudflaredBinary,
+} from '../cloudflare.js';
 import {
   buildFrpcConfig,
   ensureFrpcBinary,
@@ -486,10 +492,29 @@ export class TransportManager {
         },
       };
       this.channel = channel;
+      // cloudflared 托管引导：配置路径 / 用户手放 / PATH 都没有时自动下载（与 frpc/ngrok 同策略）
+      let command = this.cfg.cloudflaredPath;
+      try {
+        const { exePath } = await ensureCloudflaredBinary({
+          dir: cloudflaredHomeDir(this.home),
+          log: this.log,
+          executablePath: this.cfg.cloudflaredPath,
+          ...(this.fetchJson !== undefined ? { fetchJson: this.fetchJson } : {}),
+          ...(this.fetchBuffer !== undefined ? { fetchBuffer: this.fetchBuffer } : {}),
+        });
+        command = exePath;
+      } catch (error) {
+        state.status = 'error';
+        state.url = '';
+        state.error = `cloudflared 就位失败：${error instanceof Error ? error.message : String(error)}（已降级局域网）`;
+        this.log(state.error);
+        this.notify();
+        return;
+      }
       const promise = this.quickStarter({
         bridgePort: this.localPort,
         targetHost: '127.0.0.1',
-        command: this.cfg.cloudflaredPath,
+        command,
         protocol: this.cfg.cloudflaredProtocol,
         dnsResolvers: this.cfg.cloudflaredDnsResolvers,
         timeoutMs: 60_000,

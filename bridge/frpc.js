@@ -23,6 +23,36 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+
+/** 插件内置 frpc 目录：<插件根>/bin（发版时把 frpc-windows-amd64.exe 放这里即可）。 */
+export function bundledFrpcDir() {
+  // bridge/frpc.js → 上两级 = 插件根
+  return path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), 'bin');
+}
+
+/** 内置 frpc 的标准文件名（跨平台探测，Windows 名优先）。 */
+export const BUNDLED_FRPC_NAMES = process.platform === 'win32'
+  ? ['frpc-windows-amd64.exe', 'frpc.exe']
+  : ['frpc-linux-amd64', 'frpc'];
+
+/** PATH 中查找 frpc（用户装过官方包的优先 PATH）。 */
+export function findFrpcOnPath(environment = process.env) {
+  const rawPath = typeof environment.PATH === 'string' ? environment.PATH : '';
+  if (rawPath.length === 0) return '';
+  const names = process.platform === 'win32' ? ['frpc.exe', 'frpc'] : ['frpc', 'frpc.exe'];
+  for (const directory of rawPath.split(path.delimiter)) {
+    const cleanDirectory = directory.trim().replace(/^"|"$/g, '');
+    if (cleanDirectory.length === 0) continue;
+    for (const name of names) {
+      const candidate = path.join(cleanDirectory, name);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return '';
+}
 
 /** 锁定的 frp 版本（可用环境变量 DSH_FRP_VERSION 覆盖，便于运维升级）。 */
 export const FRP_VERSION = process.env.DSH_FRP_VERSION || '0.61.1';
@@ -298,14 +328,16 @@ export function extractRemotePort(line) {
 }
 
 /**
- * 确保 frpc 二进制就位：用户手放的永远优先（存在即用，不覆盖）；
- * 缺失时从官方 GitHub releases 下载 → size/sha256 双校验 → 抽 frpc.exe 落盘。
+ * 确保 frpc 二进制就位：插件内置 → 用户手放 → 配置路径 → PATH → 官方 release 下载；
+ * 内置/手放的永远优先（存在即用，不覆盖），下载后做 size/sha256 双校验再落盘。
  * @param {{
  *   frpcDir: string, log?: (msg: string) => void,
  *   fetchJson?: (url: string) => Promise<any>,
  *   fetchBuffer?: (url: string) => Promise<Buffer>,
+ *   executablePath?: string,
+ *   bundledDir?: string,
  * }} options
- * @returns {Promise<{ exePath: string, source: 'user'|'managed' }>}
+ * @returns {Promise<{ exePath: string, source: 'bundled'|'configured'|'user'|'path'|'managed' }>}
  */
 export async function ensureFrpcBinary(options) {
   const frpcDir = options.frpcDir;
@@ -314,10 +346,40 @@ export async function ensureFrpcBinary(options) {
   const fetchBuffer = typeof options.fetchBuffer === 'function' ? options.fetchBuffer : defaultFetchBuffer;
   fs.mkdirSync(frpcDir, { recursive: true });
 
+  const configuredPath = typeof options.executablePath === 'string' ? options.executablePath.trim() : '';
+  if (configuredPath.length > 0) {
+    const absolutePath = path.resolve(configuredPath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      throw new Error(`配置的 frpcPath 不存在或不是文件：${absolutePath}`);
+    }
+    log(`使用配置的官方 frpc：${absolutePath}`);
+    return { exePath: absolutePath, source: 'configured' };
+  }
+
+  // 插件内置优先：发版时把官方 frpc 放进 <插件根>/bin/frpc-windows-amd64.exe，离线零下载
+  const bundledDir = typeof options.bundledDir === 'string' && options.bundledDir.length > 0
+    ? options.bundledDir
+    : bundledFrpcDir();
+  for (const name of BUNDLED_FRPC_NAMES) {
+    const candidate = path.join(bundledDir, name);
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        log(`使用插件内置的官方 frpc：${candidate}`);
+        return { exePath: candidate, source: 'bundled' };
+      }
+    } catch {}
+  }
+
   const exePath = path.join(frpcDir, 'frpc.exe');
   if (fs.existsSync(exePath)) {
     log('检测到用户提供的 frpc.exe，跳过自动下载（用户手放优先，不覆盖）');
     return { exePath, source: 'user' };
+  }
+
+  const pathExecutable = findFrpcOnPath();
+  if (pathExecutable.length > 0) {
+    log(`使用 PATH 中的官方 frpc：${pathExecutable}`);
+    return { exePath: pathExecutable, source: 'path' };
   }
 
   const info = frpReleaseInfo();

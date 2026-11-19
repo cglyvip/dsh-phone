@@ -64,7 +64,7 @@ export function normalize(config) {
     host: typeof raw.host === 'string' && raw.host.length > 0 ? raw.host : '0.0.0.0',
     port: port >= 0 && port <= 65535 ? port : 8787,
     authMode: raw.authMode === 'none' ? 'none' : 'token',
-    tokenTtlDays: Number.isFinite(raw.tokenTtlDays) ? raw.tokenTtlDays : 7,
+    tokenTtlDays: Number.isFinite(raw.tokenTtlDays) ? raw.tokenTtlDays : 365,
     pairingMode: raw.pairingMode === 'disabled' ? 'disabled' : 'lan',
     allowOrigins: Array.isArray(raw.allowOrigins) ? raw.allowOrigins : [],
     publicUrl: typeof raw.publicUrl === 'string' ? raw.publicUrl : '',

@@ -1538,6 +1538,7 @@ async function main() {
   const frpcDirB = join(tmpDir, 'phone-bridge', 'frpc-b');
   const installed = await ensureFrpcBinary({
     frpcDir: frpcDirB,
+    bundledDir: join(tmpDir, 'phone-bridge', 'no-bundle'),
     log: frpLog,
     fetchJson: async () => ({
       assets: [{
@@ -1555,6 +1556,7 @@ async function main() {
   await assert.rejects(
     () => ensureFrpcBinary({
       frpcDir: frpcDirC,
+      bundledDir: join(tmpDir, 'phone-bridge', 'no-bundle'),
       fetchJson: async () => ({ assets: [{ name: frpReleaseInfo().asset, size: releaseZip.length, digest: `sha256:${expected.sha256}`, browser_download_url: 'x' }] }),
       fetchBuffer: async () => tampered,
     }),
@@ -1567,12 +1569,28 @@ async function main() {
   writeFileSync(join(frpcDirD, 'frpc.exe'), 'USER-FRPC');
   const userPlaced = await ensureFrpcBinary({
     frpcDir: frpcDirD,
+    bundledDir: join(tmpDir, 'phone-bridge', 'no-bundle'),
     fetchJson: async () => { throw new Error('不应触发下载'); },
     fetchBuffer: async () => { throw new Error('不应触发下载'); },
   });
   assert.equal(userPlaced.source, 'user');
   assert.equal(readFileSync(userPlaced.exePath).toString(), 'USER-FRPC', '用户手放的 frpc 不被覆盖');
   pass('frpc 自动引导（合法落盘 / 篡改拒绝落盘 / 用户手放优先）');
+
+  // 25c) 插件内置 frpc：<插件根>/bin/frpc-windows-amd64.exe 优先于用户手放与下载（离线零下载）
+  const frpcDirBundle = join(tmpDir, 'phone-bridge', 'frpc-bundle');
+  const bundleBin = join(tmpDir, 'phone-bridge', 'bin');
+  mkdirSync(bundleBin, { recursive: true });
+  writeFileSync(join(bundleBin, 'frpc-windows-amd64.exe'), 'BUNDLED-FRPC');
+  const bundled = await ensureFrpcBinary({
+    frpcDir: frpcDirBundle,
+    bundledDir: bundleBin,
+    fetchJson: async () => { throw new Error('不应触发下载'); },
+    fetchBuffer: async () => { throw new Error('不应触发下载'); },
+  });
+  assert.equal(bundled.source, 'bundled');
+  assert.equal(readFileSync(bundled.exePath).toString(), 'BUNDLED-FRPC', '内置 frpc 应被优先选中');
+  pass('frpc 插件内置优先（bin/frpc-windows-amd64.exe 离线零下载）');
 
   // 26) v3.2 §10 frp：frpc 崩溃重启策略（指数退避，最多 5 次）
   const frpcHomeE = mkdtempSync(join(tmpdir(), 'dsh-bridge-frp-e-'));
@@ -1772,6 +1790,9 @@ async function main() {
       },
     };
   };
+  // quick 通道 cloudflared 托管引导：测试环境用「用户手放」路径（不触网）
+  mkdirSync(join(frpcHomeE, 'phone-bridge', 'cloudflared'), { recursive: true });
+  writeFileSync(join(frpcHomeE, 'phone-bridge', 'cloudflared', 'cloudflared.exe'), 'fake');
   const transportG = new TransportManager({
     config: normalizeTransportConfig({
       tunnelMode: 'quick',

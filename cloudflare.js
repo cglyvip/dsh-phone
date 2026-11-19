@@ -11,7 +11,131 @@
  * 一律 403 —— 否则隧道流量从 127.0.0.1 连入，socket 层面无法与本机用户区分，
  * 外网用户就能自助拿配对码。本机直连/局域网的 Host 是 IP:端口，判别 100% 可靠。
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
+
+/** 锁定的 cloudflared 版本（环境变量 DSH_CLOUDFLARED_VERSION 可覆盖）。 */
+export const CLOUDFLARED_VERSION = process.env.DSH_CLOUDFLARED_VERSION || '2026.11.1';
+
+export const CLOUDFLARED_REPO = 'Cloudflare/cloudflared';
+
+/** 官方 release 的裸 exe 资产与 API 地址（Windows 版不是 zip，直接是 exe）。 */
+export function cloudflaredReleaseInfo(version = CLOUDFLARED_VERSION) {
+  const tag = version; // 官方 tag 形如 2026.11.1（无 v 前缀）
+  const asset = 'cloudflared-windows-amd64.exe';
+  return {
+    tag,
+    asset,
+    api: `https://api.github.com/repos/${CLOUDFLARED_REPO}/releases/tags/${tag}`,
+    download: `https://github.com/${CLOUDFLARED_REPO}/releases/download/${tag}/${asset}`,
+    binaryName: 'cloudflared.exe',
+  };
+}
+
+/** cloudflared 托管目录：$DSH_HOME/phone-bridge/cloudflared。 */
+export function cloudflaredHomeDir(home) {
+  return path.join(home, 'phone-bridge', 'cloudflared');
+}
+
+/** PATH 中查找 cloudflared（用户装过 winget/scoop 的优先 PATH）。 */
+export function findCloudflaredOnPath(environment = process.env) {
+  const rawPath = typeof environment.PATH === 'string' ? environment.PATH : '';
+  if (rawPath.length === 0) return '';
+  const names = process.platform === 'win32' ? ['cloudflared.exe', 'cloudflared'] : ['cloudflared', 'cloudflared.exe'];
+  for (const directory of rawPath.split(path.delimiter)) {
+    const cleanDirectory = directory.trim().replace(/^"|"$/g, '');
+    if (cleanDirectory.length === 0) continue;
+    for (const name of names) {
+      const candidate = path.join(cleanDirectory, name);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return '';
+}
+
+/**
+ * 确保 cloudflared 二进制就位（对齐 frpc/ngrok 托管策略）：
+ *   1. 配置的 cloudflaredPath 优先（用户显式指定，存在即用）；
+ *   2. 用户手放 ~/.dsh/phone-bridge/cloudflared/cloudflared.exe 次之，不覆盖；
+ *   3. PATH 中的 cloudflared 再次（winget 安装场景）；
+ *   4. 都没有 → 官方 GitHub release 下载（size + sha256 双校验，校验不过绝不落盘）。
+ * @returns {Promise<{ exePath: string, source: 'configured'|'user'|'path'|'managed' }>}
+ */
+export async function ensureCloudflaredBinary(options) {
+  const dir = options.dir;
+  const log = typeof options.log === 'function' ? options.log : () => {};
+  const fetchJson = typeof options.fetchJson === 'function' ? options.fetchJson : defaultFetchJson;
+  const fetchBuffer = typeof options.fetchBuffer === 'function' ? options.fetchBuffer : defaultFetchBuffer;
+  fs.mkdirSync(dir, { recursive: true });
+
+  const configuredPath = typeof options.executablePath === 'string' ? options.executablePath.trim() : '';
+  if (configuredPath.length > 0 && configuredPath !== 'cloudflared') {
+    const absolutePath = path.resolve(configuredPath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      throw new Error(`配置的 cloudflaredPath 不存在或不是文件：${absolutePath}`);
+    }
+    log(`使用配置的官方 cloudflared：${absolutePath}`);
+    return { exePath: absolutePath, source: 'configured' };
+  }
+
+  const exePath = path.join(dir, 'cloudflared.exe');
+  if (fs.existsSync(exePath)) {
+    log('检测到用户提供的 cloudflared.exe，跳过自动下载（用户手放优先，不覆盖）');
+    return { exePath, source: 'user' };
+  }
+
+  const pathExecutable = findCloudflaredOnPath();
+  if (pathExecutable.length > 0) {
+    log(`使用 PATH 中的 cloudflared：${pathExecutable}`);
+    return { exePath: pathExecutable, source: 'path' };
+  }
+
+  const info = cloudflaredReleaseInfo();
+  log(`未找到本地 cloudflared，开始从官方 release 下载：${info.download}`);
+  const release = await fetchJson(info.api);
+  const assets = release !== null && typeof release === 'object' && Array.isArray(release.assets) ? release.assets : [];
+  const asset = assets.find((item) => item !== null && typeof item === 'object' && item.name === info.asset);
+  if (asset === undefined) {
+    throw new Error(`cloudflared release 未找到 ${info.asset}；请手动安装（winget install Cloudflare.cloudflared）或把 cloudflared.exe 放到 ${dir}`);
+  }
+  // 官方 release 资产不带独立 checksums 文件：size 强制 + sha256 尽力（assets.digest）
+  const expected = {
+    size: Number.isInteger(asset.size) ? asset.size : -1,
+    sha256: typeof asset.digest === 'string' && asset.digest.startsWith('sha256:') ? asset.digest.slice(7) : '',
+  };
+  const bytes = await fetchBuffer(asset.browser_download_url);
+  if (!(bytes instanceof Buffer) || bytes.length === 0) {
+    throw new Error('cloudflared 下载失败：产物为空');
+  }
+  if (Number.isInteger(expected.size) && expected.size > 0 && bytes.length !== expected.size) {
+    throw new Error(`cloudflared 下载校验失败：字节数不符（期望 ${expected.size}，实际 ${bytes.length}）`);
+  }
+  if (expected.sha256.length === 64) {
+    const { createHash } = await import('node:crypto');
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual !== expected.sha256) {
+      throw new Error('cloudflared 下载校验失败：sha256 不符——产物可能被篡改，已拒绝落盘');
+    }
+  }
+  fs.writeFileSync(exePath, bytes);
+  log(`cloudflared.exe 已就位（官方 ${info.tag}，${bytes.length} 字节，校验通过）`);
+  return { exePath, source: 'managed' };
+}
+
+async function defaultFetchJson(url) {
+  const response = await fetch(url, { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-phone-bridge' } });
+  if (!response.ok) throw new Error(`cloudflared release 元数据获取失败：HTTP ${response.status}（${url}）`);
+  return response.json();
+}
+
+async function defaultFetchBuffer(url) {
+  const response = await fetch(url, { headers: { 'User-Agent': 'dsh-phone-bridge' } });
+  if (!response.ok) throw new Error(`cloudflared 下载失败：HTTP ${response.status}（${url}）`);
+  return Buffer.from(await response.arrayBuffer());
+}
 
 const URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi;
 const DEFAULT_TIMEOUT_MS = 60000;

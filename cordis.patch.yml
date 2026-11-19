@@ -12,8 +12,8 @@
         port: 9000
         # 鉴权：token（推荐）/ none（仅本机调试，禁止用于发布）
         authMode: token
-        # 令牌有效期（天）
-        tokenTtlDays: 7
+        # 令牌有效期（天）：默认一年，避免静默过期导致手机端"一直连不上"
+        tokenTtlDays: 365
         # 配对模式：lan（允许局域网配对）/ disabled（关闭配对）
         pairingMode: lan
         # 允许的跨域来源（一般留空）
