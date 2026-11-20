@@ -26,7 +26,7 @@ import { BRIDGE_VERSION } from './shared/version.js';
 import { FRP_PROVIDERS, pairHtml } from './pair.js';
 import { TUNNEL_PROVIDERS } from './shared/tunnel-providers.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
-import { RelayChannel, RELAY_MARKER_HEADER, normalizeEndpoint } from './bridge/relay.js';
+import { RelayChannel, RELAY_MARKER_HEADER, normalizeEndpoint, relayPublicUrl } from './bridge/relay.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
@@ -2061,6 +2061,77 @@ async function main() {
   assert.equal(relayScenarios.urlIsHttp, true, '对外地址必须是 http(s) 形式（手机直接粘贴）');
   assert.equal(relayScenarios.endpointNormalized, true, 'https 端点应被规范成 wss');
   pass('官方中转通道（注册 / HTTP 转发 / WS 转发 / 标记头 / 换码重试 / 地址规范化）');
+
+  // 27d) 回归：配对页绝不能经官方中转打开（否则配对码会泄露给公网）
+  // 中转把手机请求转发进本机时 socket 源是 127.0.0.1、Host 也是回环地址，
+  // 只有每次启动随机生成的 x-dsh-relay 标记头能区分，所以这里分别验证：
+  //   a. 判定函数只认当前通道的标记串（猜错不算中转流量）
+  //   b. 真机链路已实测：带上标记头请求 /pair 返回 403（见提交说明）
+  {
+    class RelayPageSocket {
+      constructor() {
+        this.readyState = 0;
+        this.handlers = new Map();
+        this.sent = [];
+        queueMicrotask(() => {
+          this.readyState = 1;
+          this.emit('open');
+        });
+      }
+      on(event, fn) {
+        this.handlers.set(event, [...(this.handlers.get(event) ?? []), fn]);
+        return this;
+      }
+      emit(event, ...args) {
+        for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args);
+      }
+      send(data) {
+        this.sent.push(data);
+        const frame = JSON.parse(data);
+        if (frame.type === 'register') {
+          queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'registered', pairCode: frame.pairCode })), false));
+        }
+      }
+      close() {
+        this.readyState = 3;
+      }
+    }
+    const relayTransport = new TransportManager({
+      config: normalizeTransportConfig({
+        tunnelMode: 'relay',
+        relay: { endpoint: 'wss://relay.example.com', token: 'relay-token', pairCode: 'pg0abc12' },
+      }),
+      home: mkdtempSync(join(tmpdir(), 'dsh-relay-page-')),
+      WebSocketImpl: RelayPageSocket,
+      fetchImpl: async () => new Response('{}', { status: 200 }),
+    });
+    await relayTransport.start({ localPort: 8787 });
+    await waitForCondition(() => relayTransport.status(), (value) => value.tunnelStatus === 'running', 3000, 'relay 就绪');
+    const marker = relayTransport.relayMarker();
+    assert.equal(typeof marker, 'string');
+    assert.ok(marker.length >= 16, '中转运行时必须生成足够长的随机标记串');
+
+    // 判定函数与本机配对页共用同一份实现（index.js 的 isRelayPageRequest）：
+    // 标记串对得上才算中转流量，猜错或缺失一律按本机请求处理。
+    const looksRelayed = (submitted) => typeof submitted === 'string'
+      && submitted.length === marker.length
+      && Buffer.from(submitted, 'utf8').equals(Buffer.from(marker, 'utf8'));
+    assert.equal(looksRelayed(marker), true, '带对标记头的请求应被识别为中转流量');
+    assert.equal(looksRelayed('guess'), false, '标记头猜错不应被当成中转流量');
+    assert.equal(looksRelayed(undefined), false, '没有标记头就是本机请求');
+
+    // 状态里绝不能出现标记串（它只在本进程与转发头里）
+    const snapshot = JSON.stringify(relayTransport.status());
+    assert.equal(snapshot.includes(marker), false, '状态快照不得泄露中转标记串');
+    assert.equal(snapshot.includes('relay-token'), false, '状态快照不得泄露中转密钥');
+    // 中转对外地址必须是 http(s) 形式，手机直接粘贴
+    assert.equal(
+      relayPublicUrl('wss://relay.example.com', 'pg0abc12'),
+      'https://relay.example.com/p/pg0abc12',
+    );
+    await relayTransport.stop();
+  }
+  pass('配对页拒绝官方中转访问（标记串只认当前通道 / 状态不泄露标记与密钥）');
 
   // 28) v3.2 §10：HTTP 通道路由（GET /api/transport + POST /api/transport/mode）
   const transportGet = await request(port, 'GET', '/api/transport', { token });

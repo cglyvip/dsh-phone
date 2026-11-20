@@ -17,7 +17,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { BRIDGE_VERSION, CONTRACT_VERSION, MIN_CONTRACT_VERSION, PROTOCOL } from './shared/version.js';
 import { BridgeError, ErrorCode, asBridgeError, sendJson, sendText } from './bridge/errors.js';
@@ -29,7 +29,7 @@ import { TransportManager, TUNNEL_MODES, normalizeTransportConfig } from './brid
 import { DshAdapter } from './adapter/dsh.js';
 import { lanAddress, pairHtml } from './pair.js';
 import { normalizeCloudflaredProtocol, normalizeCloudflaredDnsResolvers } from './cloudflare.js';
-import { DEFAULT_RELAY_ENDPOINT } from './bridge/relay.js';
+import { DEFAULT_RELAY_ENDPOINT, RELAY_MARKER_HEADER } from './bridge/relay.js';
 
 export const name = 'dsh-phone-bridge';
 export const version = BRIDGE_VERSION;
@@ -220,6 +220,16 @@ export function apply(ctx, config) {
       }),
       home: defaultTokenHome(),
       log,
+      // 中转配对码被服务端判为占用时通道会自动换码；必须落盘，
+      // 否则重启后旧码再来一次，手机端显示的地址就和桥上实际注册的不一致。
+      onPairCodeChange: (code) => {
+        const current = { tunnelMode: 'relay', relay: { pairCode: code } };
+        try {
+          persistTransportOverride(transportOverrideFile, current);
+        } catch (error) {
+          log(`中转配对码落盘失败: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      },
     });
     const localControlToken = randomBytes(32).toString('base64url');
 
@@ -234,6 +244,22 @@ export function apply(ctx, config) {
       config: cfg,
       log,
     });
+
+    /**
+     * 判断这个请求是不是官方中转转发进来的。
+     *
+     * 中转在服务端把手机请求带进本机，socket 源是 127.0.0.1，与真正的本机用户
+     * 无法区分；中转会给每个请求加上每次启动随机生成的 x-dsh-relay 标记头
+     * （见 bridge/relay.js），这里用定长比较把它和本机请求区分开。
+     */
+    function isRelayPageRequest(request) {
+      if (typeof transport.relayMarker !== 'function') return false;
+      const expected = transport.relayMarker();
+      if (typeof expected !== 'string' || expected.length === 0) return false;
+      const submitted = request.headers[RELAY_MARKER_HEADER];
+      if (typeof submitted !== 'string' || submitted.length !== expected.length) return false;
+      return timingSafeEqual(Buffer.from(submitted, 'utf8'), Buffer.from(expected, 'utf8'));
+    }
 
     /** 统一的 HTTP 服务器：/health、/pair、/ 以及 /api/** */
     const server = http.createServer((request, response) => {
@@ -287,6 +313,12 @@ export function apply(ctx, config) {
         const hostIsLoopback = hostPart === '127.0.0.1' || hostPart === 'localhost' || hostPart === '[::1]' || hostPart === '::1';
         if (host === 'dsh-phone-bridge-tunnel') {
           sendText(response, 403, '配对页不允许通过公网隧道访问');
+          return;
+        }
+        // 官方中转转发进来的请求 socket 同样是 127.0.0.1，必须靠标记头识别；
+        // 否则手机/任何人从 /p/<配对码> 打开配对页，就能看到并直接用掉配对码。
+        if (isRelayPageRequest(request)) {
+          sendText(response, 403, '配对页不允许通过公网中转访问');
           return;
         }
         if (!isLoopback || !hostIsLoopback) {

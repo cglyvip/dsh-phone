@@ -16,6 +16,7 @@
  * 依赖注入（spawn/fetch/timer/quickStarter）全部可替换，smoke-test 用 mock 进程覆盖。
  */
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import {
   startQuickTunnel,
   normalizeCloudflaredProtocol,
@@ -435,6 +436,8 @@ export class TransportManager {
     this.relayMaxReconnects = Number.isInteger(deps.relayMaxReconnects) ? deps.relayMaxReconnects : undefined;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.onPairCodeChange = typeof deps.onPairCodeChange === 'function' ? deps.onPairCodeChange : undefined;
+    /** 上次落盘用的文件（switchMode 带 persistFile 时记住，供自动换码时回写）。 */
+    this.persistFile = '';
     this.localPort = 0;
     this.switching = false;
     this.channel = null;      // 当前通道实例：统一有 snapshot()，进程型通道另有 stop()
@@ -516,6 +519,7 @@ export class TransportManager {
           if (!isValidPairCode(code)) return;
           this.cfg.relay.pairCode = code;
           this.log(`中转配对码已更新：${code}`);
+          if (this.persistFile.length > 0) this.writePersistFile(this.persistFile);
           if (typeof this.onPairCodeChange === 'function') {
             try {
               this.onPairCodeChange(code);
@@ -784,25 +788,8 @@ export class TransportManager {
     this.cfg.tunnelMode = mode;
     const persistFile = typeof options.persistFile === 'string' ? options.persistFile : '';
     if (persistFile.length > 0) {
-      try {
-        const fs = await import('node:fs');
-        // 持久化完整通道参数：frp token / ngrok authtoken 只落这里（600），不回显到任何响应
-        const persistPayload = {
-          tunnelMode: mode,
-          publicUrl: this.cfg.publicUrl,
-          frp: this.cfg.frp,
-          ngrok: this.cfg.ngrok,
-          relay: this.cfg.relay,
-        };
-        fs.writeFileSync(persistFile, `${JSON.stringify(persistPayload, null, 2)}\n`, 'utf8');
-        try {
-          fs.chmodSync(persistFile, 0o600);
-        } catch {
-          // Windows chmod 语义有限
-        }
-      } catch (error) {
-        this.log(`通道选择持久化失败: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      this.persistFile = persistFile;
+      this.writePersistFile(persistFile, mode);
     }
     await this.startChannel(mode, verifiedEndpoint);
     return this.status();
@@ -811,6 +798,34 @@ export class TransportManager {
   /** 停掉当前通道（桥 dispose / 启动失败清理时调用）。 */
   async stop() {
     await this.stopChannel();
+  }
+
+  /**
+   * 把当前通道配置写到 transport.json（600）。
+   *
+   * frp token / ngrok authtoken / relay 中转密钥只落这里，不回显到任何响应。
+   * 中转自动换码时也走这条路径，保证重启后仍用服务端认的那个码。
+   */
+  writePersistFile(persistFile, mode = this.cfg.tunnelMode) {
+    try {
+      const persistPayload = {
+        tunnelMode: mode,
+        publicUrl: this.cfg.publicUrl,
+        frp: this.cfg.frp,
+        ngrok: this.cfg.ngrok,
+        relay: this.cfg.relay,
+      };
+      fs.writeFileSync(persistFile, `${JSON.stringify(persistPayload, null, 2)}\n`, 'utf8');
+      try {
+        fs.chmodSync(persistFile, 0o600);
+      } catch {
+        // Windows chmod 语义有限
+      }
+      return true;
+    } catch (error) {
+      this.log(`通道选择持久化失败: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
   }
 
   /** 状态快照：全部进 /api/health 与配对页（不含任何 token/authtoken）。 */
