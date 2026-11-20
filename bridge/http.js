@@ -233,6 +233,9 @@ export function createHttpHandler(deps) {
     if (typeof body.publicUrl === 'string') switchParams.publicUrl = body.publicUrl;
     if (body.frp !== null && typeof body.frp === 'object') switchParams.frp = body.frp;
     if (body.ngrok !== null && typeof body.ngrok === 'object') switchParams.ngrok = body.ngrok;
+    // v3.8：relay 参数（endpoint / token / pairCode）漏了这一行，配对页「开启中转」
+    // 永远报「中转密钥不能为空」——参数在路由层就被丢掉了，根本到不了 TransportManager。
+    if (body.relay !== null && typeof body.relay === 'object') switchParams.relay = body.relay;
     return transport.switchMode(mode, {
       ...(Object.keys(switchParams).length > 0 ? { params: switchParams } : {}),
       ...(typeof transportPersistFile === 'string' && transportPersistFile.length > 0

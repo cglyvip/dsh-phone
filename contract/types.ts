@@ -11,7 +11,7 @@
 
 export const CONTRACT_VERSION = 3 as const;
 export const MIN_CONTRACT_VERSION = 3 as const;
-export const BRIDGE_VERSION = '3.8.1';
+export const BRIDGE_VERSION = '3.8.2';
 export const PROTOCOL = 'dsh-phone-bridge';
 
 // ── 通用 ────────────────────────────────────────────────────────────────

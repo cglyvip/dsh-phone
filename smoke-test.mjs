@@ -2359,6 +2359,65 @@ async function main() {
   assert.ok(!frpEchoRender.includes('vps-secret-token'), '配对页绝不回显 frp token');
   pass('frp 服务商预设模板 + 配对页卡片渲染（frp/custom/ngrok 表单齐全 + 参数回显不含密钥）');
 
+  // 32b) 回归：配对页「开启中转」的参数必须能经 HTTP 路由进到 TransportManager
+  // 原先 handleTransportSwitch 只转发 publicUrl/frp/ngrok，relay 参数被静默丢弃，
+  // 页面上点「开启中转」永远报「中转密钥不能为空」。
+  {
+    const relayHome = mkdtempSync(join(tmpdir(), 'dsh-relay-switch-'));
+    const previousHome = process.env.DSH_HOME;
+    process.env.DSH_HOME = relayHome;
+    try {
+      class RelaySwitchSocket {
+        constructor() {
+          this.readyState = 0;
+          this.handlers = new Map();
+          this.sent = [];
+          queueMicrotask(() => {
+            this.readyState = 1;
+            this.emit('open');
+          });
+        }
+        on(event, fn) {
+          this.handlers.set(event, [...(this.handlers.get(event) ?? []), fn]);
+          return this;
+        }
+        emit(event, ...args) {
+          for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args);
+        }
+        send(data) {
+          this.sent.push(data);
+          const frame = JSON.parse(data);
+          if (frame.type === 'register') {
+            queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'registered', pairCode: frame.pairCode })), false));
+          }
+        }
+        close() {
+          this.readyState = 3;
+        }
+      }
+      const relayTransport = new TransportManager({
+        config: normalizeTransportConfig({ tunnelMode: 'off' }),
+        home: relayHome,
+        WebSocketImpl: RelaySwitchSocket,
+        fetchImpl: async () => new Response('{}', { status: 200 }),
+      });
+      await relayTransport.start({ localPort: 8787 });
+      // 与配对页「开启中转」发出的 payload 完全一致
+      const switched = await relayTransport.switchMode('relay', {
+        params: { relay: { endpoint: 'wss://relay.example.com', token: 'page-secret-token' } },
+      });
+      assert.equal(switched.tunnelMode, 'relay');
+      await waitForCondition(() => relayTransport.status(), (value) => value.tunnelStatus === 'running', 3000, 'relay 通道');
+      assert.match(relayTransport.status().tunnelUrl, /^https:\/\/relay\.example\.com\/p\/[a-z0-9]{8}$/,
+        '配对码留空时应自动生成 8 位码并拼出手机地址');
+      assert.ok(!JSON.stringify(relayTransport.status()).includes('page-secret-token'), '中转密钥不得回显');
+      await relayTransport.stop();
+    } finally {
+      process.env.DSH_HOME = previousHome;
+    }
+  }
+  pass('中转通道参数经 HTTP 路由生效（端点/密钥转发 + 配对码自动生成 + 密钥不回显）');
+
   // 33) v3.3 §10.1：HTTP 切换带参数持久化（token/authtoken 只落盘不回显）
   mkdirSync(join(tmpDir, 'phone-bridge', 'ngrok'), { recursive: true });
   writeFileSync(join(tmpDir, 'phone-bridge', 'ngrok', 'ngrok.exe'), 'USER-NGROK');

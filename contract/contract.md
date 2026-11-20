@@ -4,9 +4,15 @@
 > 类型定义见同目录 `types.ts`；鸿蒙端的镜像类型在
 > `dsh-harmony/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
 
-- 桥版本：`3.8.1`
+- 桥版本：`3.8.2`
 - 契约版本：`3`（`MIN_CONTRACT_VERSION = 3`）
 - 协议名：`dsh-phone-bridge`
+
+### 3.8.2 修复：配对页「开启中转」无效
+
+`POST /api/transport/mode` 的路由层只转发了 `publicUrl` / `frp` / `ngrok`，
+`relay` 参数被静默丢弃，配对页点「开启中转」永远返回「中转密钥不能为空」。
+现在 `relay` 与其它通道参数一样透传，并按「留空保持原值」合并。
 
 ### 3.8.1 安全修复：配对页拒绝中转来源
 
@@ -373,6 +379,7 @@ Content-Type: application/json
 | 3.6.0 | 公网接入补充：14 项穿透服务目录、`tcp://` 根地址探活、本机通道专用凭据、新电脑安装脚本 |
 | 3.7.0 | 会话内媒体转出（§3.3）：投影层识别 markdown 链接与 `Presented <路径>` 行并按会话 cwd 展开；媒体块提升到助手消息；`GET /api/media/:id` 支持 `media:v1.<base64url(绝对路径)>`（白名单 realpath 校验，越权 404）；正文本机路径降级；纯增量，CONTRACT_VERSION 仍为 3 |
 | 3.8.0 | 官方中转通道（§10.2）：`tunnelMode: relay`，电脑主动拨 WSS 到中转服务、手机按 8 位配对码从同一服务拨入，零网络配置；`relay{endpoint,token,pairCode}` 配置与 `channels.relay` 状态；每条中转请求带每次启动随机的 `x-dsh-relay` 标记头，修复中转流量被误判为本机而泄露配对码的问题；纯增量，CONTRACT_VERSION 仍为 3 |
+| 3.8.2 | 修复（§3.8.2）：`POST /api/transport/mode` 补透传 `relay` 参数，配对页「开启中转」不再报「中转密钥不能为空」；纯修复，契约不变 |
 | 3.8.1 | 安全修复（§3.8.1）：`/pair` 与 `/` 也校验 `x-dsh-relay`，配对页不再能经 `/p/<配对码>` 从公网打开（此前会泄露 6 位配对码并可直接换令牌）；中转自动换码改为立即写回 `transport.json`；纯修复，契约不变 |
 
 ---
