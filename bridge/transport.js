@@ -410,6 +410,7 @@ export class TransportManager {
    *   relayReconnectBaseMs?: number,
    *   relayMaxReconnects?: number,
    *   onPairCodeChange?: (code: string) => void,
+   *   persistFile?: string,
    * }} deps
    */
   constructor(deps) {
@@ -436,8 +437,8 @@ export class TransportManager {
     this.relayMaxReconnects = Number.isInteger(deps.relayMaxReconnects) ? deps.relayMaxReconnects : undefined;
     this.probeEndpoint = typeof deps.probeEndpoint === 'function' ? deps.probeEndpoint : probePublicUrl;
     this.onPairCodeChange = typeof deps.onPairCodeChange === 'function' ? deps.onPairCodeChange : undefined;
-    /** 上次落盘用的文件（switchMode 带 persistFile 时记住，供自动换码时回写）。 */
-    this.persistFile = '';
+    /** 落盘用的文件（构造时给定，或 switchMode 带 persistFile 时记住），供自动换码时回写。 */
+    this.persistFile = typeof deps.persistFile === 'string' ? deps.persistFile : '';
     this.localPort = 0;
     this.switching = false;
     this.channel = null;      // 当前通道实例：统一有 snapshot()，进程型通道另有 stop()

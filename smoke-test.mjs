@@ -2418,6 +2418,57 @@ async function main() {
   }
   pass('中转通道参数经 HTTP 路由生效（端点/密钥转发 + 配对码自动生成 + 密钥不回显）');
 
+  // 32c) 回归：中转自动换码必须落到 transport.json
+  // TransportManager 原先只在 switchMode 带 persistFile 时记住文件路径，
+  // 而真实桥是在构造时就知道 transport.json 的，启动即换码的情况完全不落盘，
+  // 重启后手机端显示的旧码与桥上实际注册的码不一致。
+  {
+    const relayHome = mkdtempSync(join(tmpdir(), 'dsh-relay-persist-'));
+    const persistFile = join(relayHome, 'phone-bridge', 'transport.json');
+    mkdirSync(join(relayHome, 'phone-bridge'), { recursive: true });
+    let rejectFirst = true;
+    class RotatingSocket {
+      constructor() {
+        this.readyState = 0;
+        this.handlers = new Map();
+        queueMicrotask(() => { this.readyState = 1; this.emit('open'); });
+      }
+      on(event, fn) { this.handlers.set(event, [...(this.handlers.get(event) ?? []), fn]); return this; }
+      emit(event, ...args) { for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args); }
+      send(data) {
+        const frame = JSON.parse(data);
+        if (frame.type !== 'register') return;
+        const reply = rejectFirst
+          ? { type: 'error', code: 'CODE_TAKEN' }
+          : { type: 'registered', pairCode: frame.pairCode };
+        rejectFirst = false;
+        queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify(reply)), false));
+      }
+      close() { this.readyState = 3; queueMicrotask(() => this.emit('close', 1000, 'closed')); }
+    }
+    const persisted = new TransportManager({
+      config: normalizeTransportConfig({
+        tunnelMode: 'relay',
+        relay: { endpoint: 'wss://relay.example.com', token: 'persist-secret', pairCode: 'a1b2c3d4' },
+      }),
+      home: relayHome,
+      persistFile,
+      WebSocketImpl: RotatingSocket,
+      fetchImpl: async () => new Response('{}', { status: 200 }),
+      relayReconnectBaseMs: 5,
+    });
+    await persisted.start({ localPort: 8787 });
+    await waitForCondition(() => persisted.status(), (value) => value.tunnelStatus === 'running', 3000, '换码后的 relay 通道');
+    const activeCode = persisted.status().tunnelUrl.split('/').pop();
+    assert.notEqual(activeCode, 'a1b2c3d4', '配对码被占用后应换码');
+    const onDisk = JSON.parse(readFileSync(persistFile, 'utf8'));
+    assert.equal(onDisk.tunnelMode, 'relay', '换码后 transport.json 应保留通道模式');
+    assert.equal(onDisk.relay.pairCode, activeCode, '换码后必须把新码写回 transport.json');
+    assert.equal(onDisk.relay.token, 'persist-secret', '落盘时不能丢中转密钥');
+    await persisted.stop();
+  }
+  pass('中转自动换码落盘（构造时给 persistFile，换码后 transport.json 同步新码）');
+
   // 33) v3.3 §10.1：HTTP 切换带参数持久化（token/authtoken 只落盘不回显）
   mkdirSync(join(tmpDir, 'phone-bridge', 'ngrok'), { recursive: true });
   writeFileSync(join(tmpDir, 'phone-bridge', 'ngrok', 'ngrok.exe'), 'USER-NGROK');

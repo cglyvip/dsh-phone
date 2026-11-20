@@ -222,13 +222,11 @@ export function apply(ctx, config) {
       log,
       // 中转配对码被服务端判为占用时通道会自动换码；必须落盘，
       // 否则重启后旧码再来一次，手机端显示的地址就和桥上实际注册的不一致。
+      // 落盘由 TransportManager.writePersistFile 完成（整份覆盖，含 relay token），
+      // 这里只补一条日志方便排查。
+      persistFile: transportOverrideFile,
       onPairCodeChange: (code) => {
-        const current = { tunnelMode: 'relay', relay: { pairCode: code } };
-        try {
-          persistTransportOverride(transportOverrideFile, current);
-        } catch (error) {
-          log(`中转配对码落盘失败: ${error instanceof Error ? error.message : String(error)}`);
-        }
+        log(`中转配对码已切换为 ${code}，已写入 ${transportOverrideFile}`);
       },
     });
     const localControlToken = randomBytes(32).toString('base64url');

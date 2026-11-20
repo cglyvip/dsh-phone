@@ -1,4 +1,20 @@
-﻿## 3.8.2（2026-11-20）
+﻿## 3.8.3（2026-11-20）
+
+### 修复：中转自动换码仍未落盘（3.8.1 的修复本身是坏的）
+
+3.8.1 给 `TransportManager` 传了 `onPairCodeChange`，回调里却调用一个从未定义过的
+`persistTransportOverride()`。`ReferenceError` 被回调外层的 `try/catch` 吞掉，只留一条
+日志，`transport.json` 从未被写过——换码后重启仍会拿旧码去注册。
+
+现在把持久化职责交回 `TransportManager` 自己：
+
+- 构造函数新增 `persistFile`，与 `switchMode({ persistFile })` 走同一条 `writePersistFile` 路径
+- `index.js` 构造时直接传入 `transport.json` 路径，启动即换码的情况也能落盘
+- `onPairCodeChange` 只保留一条日志，不再重复实现写文件
+- 冒烟测试新增回归项：构造时给 `persistFile` → 服务端判 `CODE_TAKEN` → 换码后
+  `transport.json` 的 `relay.pairCode` 与新码一致，且不丢 `relay.token`
+
+## 3.8.2（2026-11-20）
 
 ### 修复：配对页点「开启中转」没有任何效果
 
@@ -28,6 +44,8 @@
 配对码被服务端判为占用时通道会换一个新码并回调上层，但 `index.js` 创建
 `TransportManager` 时没传 `onPairCodeChange`，新码只活在内存里：重启后又用回旧码，
 手机端看到的地址和桥上实际注册的不一致。现在换码后立即写 `transport.json`（600）。
+
+> 更正：这次修复本身是坏的（回调调用了不存在的函数，异常被吞），真正的落盘在 3.8.3 才生效。
 
 ## 3.8.0（2026-11-20）
 
