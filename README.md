@@ -56,10 +56,30 @@ shared/version.js        版本常量
 确认电脑端可以正常对话，然后从托盘完全退出 DSH。
 
 ```powershell
-git clone https://github.com/cglyvip/dsh-phone-bridge.git
-Set-Location .\dsh-phone-bridge
+git clone https://github.com/cglyvip/dsh-phone.git
+Set-Location .\dsh-phone
 .\tools\install-local.ps1
 ```
+
+也可以不先 clone，直接从 GitHub 安装（脚本会浅克隆到临时目录，装完即删）：
+
+```powershell
+# GitHub 简写
+.\tools\install-local.ps1 -Source cglyvip/dsh-phone
+
+# 完整 Git 地址 + 指定分支或 tag
+.\tools\install-local.ps1 -Source https://github.com/cglyvip/dsh-phone.git -Ref main
+
+# 私有仓库（走 SSH）
+.\tools\install-local.ps1 -Source git@github.com:cglyvip/dsh-phone.git
+```
+
+> 仓库名是 `dsh-phone`，插件包名仍是 `dsh-phone-bridge`（安装目录、协议标识、
+> frp 代理名前缀都依赖它）。旧地址 `dsh-phone-bridge` 会自动重定向到新仓库。
+
+`-Source` 的判断顺序是「先看本地是否存在同名目录，不存在才当 Git 地址」，
+所以传相对路径不会误触远程克隆。远程安装需要电脑已装 Git；临时克隆目录在安装结束
+（无论成功失败）后自动删除，不会改动任何本地仓库。
 
 下载代码不等于已经安装插件，必须执行安装脚本。脚本使用 `npm pack` 的发布文件白名单打包，
 在独立临时目录用 `npm install` 安装运行依赖，再只替换 `node_modules/dsh-phone-bridge`。
@@ -70,7 +90,7 @@ Set-Location .\dsh-phone-bridge
 `$env:USERPROFILE\.dsh\profiles\desktop`。如果 DSH 使用自定义目录，显式指定：
 
 ```powershell
-.\tools\install-local.ps1 -Source 'D:\Projects\dsh-phone-bridge' -ProfileRoot 'D:\DSHData\profiles\desktop'
+.\tools\install-local.ps1 -Source 'D:\Projects\dsh-phone' -ProfileRoot 'D:\DSHData\profiles\desktop'
 ```
 
 安装前会在 profile 目录备份现有 `package.json` 和 `package-lock.json`，旧桥插件移动到
@@ -294,7 +314,7 @@ Cloudflare。快速隧道重启后地址可能变化，手机必须更新地址�
 ## 开发与自测
 
 ```powershell
-cd dsh-phone-bridge
+cd dsh-phone
 node smoke-test.mjs
 ```
 
