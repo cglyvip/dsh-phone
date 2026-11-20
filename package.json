@@ -37,12 +37,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cglyvip/dsh-phone-bridge.git"
+    "url": "git+https://github.com/cglyvip/dsh-phone.git"
   },
   "bugs": {
-    "url": "https://github.com/cglyvip/dsh-phone-bridge/issues"
+    "url": "https://github.com/cglyvip/dsh-phone/issues"
   },
-  "homepage": "https://github.com/cglyvip/dsh-phone-bridge#readme",
+  "homepage": "https://github.com/cglyvip/dsh-phone#readme",
   "license": "MIT",
   "keywords": [
     "dsh",

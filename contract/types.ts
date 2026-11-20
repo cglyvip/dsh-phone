@@ -11,7 +11,7 @@
 
 export const CONTRACT_VERSION = 3 as const;
 export const MIN_CONTRACT_VERSION = 3 as const;
-export const BRIDGE_VERSION = '3.7.0';
+export const BRIDGE_VERSION = '3.8.0';
 export const PROTOCOL = 'dsh-phone-bridge';
 
 // ── 通用 ────────────────────────────────────────────────────────────────
@@ -334,8 +334,8 @@ export const REST_ROUTES = [
   { method: 'PUT', path: '/api/settings/model', auth: true },
   { method: 'GET', path: '/api/workspaces', auth: true },
   { method: 'GET', path: '/api/transport', auth: true, note: 'v3.2 §10 公网通道状态' },
-  { method: 'POST', path: '/api/transport/mode', auth: true, loopbackOnly: true, note: 'v3.3 §10.1 切换通道 {tunnelMode, publicUrl?, frp?, ngrok?}，参数随切持久化（token/authtoken 只落盘不回显）' },
-  { method: 'POST', path: '/api/transport/probe', auth: true, loopbackOnly: true, note: 'v3.3 §10.1 探活 {url} → GET <url>/api/health 3s → TransportProbeResult' },
+  { method: 'POST', path: '/api/transport/mode', auth: true, loopbackOnly: true, note: 'v3.3 §10.1 切换通道 {tunnelMode, publicUrl?, frp?, ngrok?, relay?}，参数随切持久化（token/authtoken 只落盘不回显）' },
+  { method: 'POST', path: '/api/transport/probe', auth: true, loopbackOnly: true, note: '探活 {url} → 依次校验桥身份、contractVersion 与 /api/pairing-code 403 隔离 → TransportProbeResult' },
   { method: 'GET', path: '/api/sync', auth: true },
   { method: 'GET', path: '/api/search', auth: true },
   { method: 'GET', path: '/ws', auth: true, note: 'WebSocket，令牌走 ?token=' },
@@ -390,6 +390,15 @@ export type TunnelMode = 'quick' | 'named' | 'frp' | 'custom' | 'ngrok' | 'relay
 export interface NgrokTransportConfig {
   authtoken: string;
   staticDomain: string;
+}
+
+/** v3.8 §10.2 官方中转：密钥与配对码只落盘不回显。 */
+export interface RelayTransportConfig {
+  /** 中转服务地址，`wss://` 或 `https://`；留空用桥内置默认值。 */
+  endpoint: string;
+  token: string;
+  /** 8 位 `[a-z0-9]`；留空由桥自动生成。 */
+  pairCode: string;
 }
 
 export interface TransportProbeResult {

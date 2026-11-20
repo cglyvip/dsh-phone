@@ -2,11 +2,17 @@
 
 > 本文件是**桌面桥插件**与**手机 App**之间的唯一协议事实来源。
 > 类型定义见同目录 `types.ts`；鸿蒙端的镜像类型在
-> `DSH-hm/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
+> `dsh-harmony/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
 
-- 桥版本：`3.7.0`
+- 桥版本：`3.8.0`
 - 契约版本：`3`（`MIN_CONTRACT_VERSION = 3`）
 - 协议名：`dsh-phone-bridge`
+
+### 3.8.0 官方中转通道（relay，详见 §10.2）
+
+商业软件不能让用户自备 VPS、配 frps、改路由器。`tunnelMode: relay` 让电脑主动向中转服务
+拨出一条 WSS 长连接，手机也从同一服务拨入，两端靠 8 位配对码在服务端会合。
+纯增量：新增 `relay` 配置项与 `/p/<配对码>` 地址形态，其余接口不变，契约版本仍为 `3`。
 
 ### 3.7.0 会话内媒体转出（详见 §3.3）
 
@@ -359,6 +365,7 @@ Content-Type: application/json
 | 3.5.0 | 会话列表最后一条消息预览（§3.1）：items 增 `preview`（≤60 字单行摘要，占位符规则见 §3.1 注记）+ `lastRole`（'user'\|'assistant'）；桥内存缓存（message.created/done 实时 + 启动/列表前 20 批量补齐），DSH 原生不带该数据；纯增量，CONTRACT_VERSION 仍为 3 |
 | 3.6.0 | 公网接入补充：14 项穿透服务目录、`tcp://` 根地址探活、本机通道专用凭据、新电脑安装脚本 |
 | 3.7.0 | 会话内媒体转出（§3.3）：投影层识别 markdown 链接与 `Presented <路径>` 行并按会话 cwd 展开；媒体块提升到助手消息；`GET /api/media/:id` 支持 `media:v1.<base64url(绝对路径)>`（白名单 realpath 校验，越权 404）；正文本机路径降级；纯增量，CONTRACT_VERSION 仍为 3 |
+| 3.8.0 | 官方中转通道（§10.2）：`tunnelMode: relay`，电脑主动拨 WSS 到中转服务、手机按 8 位配对码从同一服务拨入，零网络配置；`relay{endpoint,token,pairCode}` 配置与 `channels.relay` 状态；每条中转请求带每次启动随机的 `x-dsh-relay` 标记头，修复中转流量被误判为本机而泄露配对码的问题；纯增量，CONTRACT_VERSION 仍为 3 |
 
 ---
 
@@ -519,20 +526,25 @@ PUT /api/sessions/:id/permission
 | `quick` | Cloudflare 快速隧道 | cloudflared | `https://xxx.trycloudflare.com`（重启变） | 免费试用 |
 | `named` | Cloudflare 命名隧道 | cloudflared + CF 域名+凭证 | `https://dsh.你的域名.com`（固定） | 个人长期自用（免费最省心） |
 | `frp` | frp 自有 VPS | frpc（插件自动下载校验）+ VPS 上的 frps | `http(s)://vps地址:远程端口`（固定） | **最稳最流畅**（直连长连接，国内 VPS 延迟最低） |
-| `relay` | 商业中转服务（订阅） | 授权服务下发凭证 | `wss://relay.xxx.com/<token>` | 商业化：订阅用户专属 |
+| `relay` | 官方中转服务（自带中转地址，无需服务器） | 中转密钥 + 8 位配对码 | `https://relay.域名/p/<8位配对码>` | 商业化：用户零网络配置 |
 
 配置形态（桥 config 增量）：
 ```yaml
-tunnelMode: quick          # quick | named | frp | relay | off
-publicUrl: ''              # named/frp/relay 模式的固定对外地址
+tunnelMode: quick          # quick | named | frp | custom | ngrok | relay | off
+publicUrl: ''              # named/custom 模式的固定对外地址
 frp:
   serverAddr: ''           # VPS IP/域名
   serverPort: 7000         # frps bind_port
   token: ''                # frps token
   remotePort: 0            # 0=由 frps 分配；桥读 frpc 输出回填 publicUrl
   useTls: false
-relay:                     # v3.2 预留：订阅中转
-  endpoint: ''
+ngrok:
+  authtoken: ''            # v3.3 托管 ngrok，只落盘不回显
+  staticDomain: ''
+relay:                     # v3.8 官方中转
+  endpoint: 'wss://relay.cgly.eu.org'   # 留空用默认值
+  token: ''                # 中转密钥，只落盘不回显
+  pairCode: ''             # 8 位 [a-z0-9]，留空自动生成
 ```
 
 - frp 通道实现参照 dsh-console 的 frpc-bootstrap（自动下载 + size/sha256 双校验，落 `~/.dsh/phone-bridge/frpc/`，用户手放优先）
@@ -559,11 +571,32 @@ relay:                     # v3.2 预留：订阅中转
 | `relay` | 官方订阅中转（商业化） | 订阅后一键 |
 
 新增接口（均仅本机）：
-- `POST /api/transport/mode` 载荷扩展：`{ tunnelMode, publicUrl?, frp?, ngrok? }`，切换时可一并写入通道参数并持久化到 transport.json（frp/ngrok 的敏感字段 token/authtoken 只落盘不回显）
-- `POST /api/transport/probe` `{ url }`：探活公网地址（对 `<url>/api/health` 发一次 GET，3s 超时），供 custom 模式粘贴后即时验证
+- `POST /api/transport/mode` 载荷扩展：`{ tunnelMode, publicUrl?, frp?, ngrok?, relay? }`，切换时可一并写入通道参数并持久化到 transport.json（frp/ngrok/relay 的敏感字段 token/authtoken 只落盘不回显，表单留空表示保持原值）
+- `POST /api/transport/probe` `{ url }`：探活公网地址，依次校验 `<url>/api/health` 的桥身份（`status: ok` + `protocol`）、`contractVersion` 兼容性，以及公网端点访问 `/api/pairing-code` 必须返回 403（配对码隔离）；3s 超时，不接受登录页、广告页或重定向
 - ngrok 托管：`~/.dsh/phone-bridge/ngrok/ngrok.exe` 自动下载（官方 releases，size/sha256 校验，用户手放优先）+ `ngrok config add-authtoken` + `ngrok http <桥端口> --domain=<静态域名> --response-header-add`；状态进 /api/health
 - frp 预设模板（配对页展示，不落敏感数据）：openfrp/natfrp/sunny-ngrok/self 的字段说明与获取入口 URL
-- 安全不变：custom/frp/ngrok 来源一律非本机 → 配对码/配对页 403；业务接口 Bearer 放行
+- 安全不变：custom/frp/ngrok/relay 来源一律非本机 → 配对码/配对页 403；业务接口 Bearer 放行
+
+### 10.2 官方中转通道（v3.8：用户零网络配置）
+
+`tunnelMode: relay` 不依赖公网 IP、端口映射或任何第三方账号：电脑向中转服务拨出 WSS，
+手机也从同一服务拨入，两端靠 8 位配对码在服务端会合。
+
+- **手机地址**：`https://<中转域名>/p/<8位配对码>`，即 `/api/transport` 里 `relay.url` 的值
+  （仅 `running` 时非空）；配对码同时通过 `relay.pairCode` 回显，便于配对页展示。
+- **配对码**：8 位 `[a-z0-9]`，留空时桥自动生成；被服务端占用时桥自动换码重试（最多 3 次）
+  并把新码写回 transport.json。它只是「在服务端找到这台电脑」的地址，不是身份凭证——
+  身份验证仍由桥签发的 Bearer 令牌负责。
+- **复用与转发**：一条 `/bridge` 连接承载多路并发请求，HTTP 用 `requestId`、WebSocket 用
+  `connId` 区分；HTTP 响应按字节流式转发（图片/视频/流式回复不被缓冲打断）。
+- **心跳与重连**：电脑每 20s 发 `{"type":"ping"}`，服务端 40s 无帧判定离线；断线后按
+  1s/2s/4s/8s/16s 退避重连，间隔封顶 60s。
+- **安全边界**：中转转发到本机桥的请求 socket 源是 `127.0.0.1`，与真实本机用户无法区分。
+  每个请求带一个**每次桥启动随机生成**的 `x-dsh-relay` 标记头，桥用定长比较识别并拒绝
+  非本机接口（`/api/pairing-code`、`/pair`、`/api/transport/mode`）；来源 IP 取自
+  `x-real-ip` → `x-forwarded-for`，避免所有中转用户共用同一个配对防爆破计数器。
+- **状态**：与其它通道一致进 `/api/health` 与 `/api/transport` 的 `channels.relay`
+  （`status` / `url` / `error` / `pairCode`）。中转不可用时桥继续监听局域网，不影响直连。
 
 ### 9.6 审批策略可写（v3.4：每步确认/全自动 可切换）
 

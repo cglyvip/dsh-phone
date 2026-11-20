@@ -318,7 +318,7 @@ cd dsh-phone
 node smoke-test.mjs
 ```
 
-`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 77 项
+`smoke-test.mjs` 用一个假 cordis ctx 把插件跑起来，端到端验证 79 项
 （REST 全部路由 + 鉴权 + 配对码一次性 + 按 turn 分页 + WS 握手/推送/过滤/增量/补拉
 + 六种公网通道切换与参数落盘 + `/api/media` 会话内媒体转出）。
 
