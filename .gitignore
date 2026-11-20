@@ -13,3 +13,8 @@ tokens.json
 *runtime.json
 local.properties
 .idea/workspace.xml
+
+# 运行时下载的第三方二进制（体积大，不进仓库）
+phone-bridge/
+cloudflared/
+*.exe
