@@ -13,7 +13,7 @@
  */
 
 import { BridgeError, ErrorCode, asBridgeError } from '../bridge/errors.js';
-import { lastChatMessage, mediaKindOf, pageByTurns, previewOfBlocks, projectEvents } from './project.js';
+import { lastChatMessage, mediaKindOf, mediaMimeOf, pageByTurns, previewOfBlocks, projectEvents } from './project.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,11 +38,8 @@ const PREVIEW_BACKFILL_LIMIT = 20;
 /** v3.5：预览缓存上限（防长期运行无限增长；超出按插入序淘汰）。 */
 const PREVIEW_CACHE_LIMIT = 1000;
 
-/**
- * v3.7：媒体块 ID 的 v1 前缀 —— `media:v1.<base64url(绝对路径)>`
- * （编码端见 project.js 的 encodeLocalMediaId）。
- */
-const MEDIA_ID_V1 = 'media:v1.';
+/** `media:v1.<base64url(绝对路径)>` 剥掉 `media:` 后的版本前缀。 */
+const MEDIA_ID_V1 = 'v1.';
 
 /** v3.7：媒体白名单根的缓存时长（毫秒）。 */
 const MEDIA_ROOTS_TTL = 60 * 1000;
@@ -69,8 +66,10 @@ const APPROVAL_TO_WIRE = { ask: 'every-step', never: 'auto' };
 /** v3.4 §9.6：手机端 approval 值 → DSH 审批策略（APPROVAL_POLICIES = ['ask','never']）。 */
 const WIRE_TO_APPROVAL = { 'every-step': 'ask', auto: 'never' };
 
-/** 附件对象文件头探测时最多读取的字节数（JPEG SOF 通常在几十 KB 内）。 */
+/** 上传时探测宽高用较大的文件头；下载只需识别 MIME，不读取图片像素。 */
 const IMAGE_HEAD_BYTES = 256 * 1024;
+const DOWNLOAD_HEAD_BYTES = 256;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 /** 安全的 home 目录（取不到就返回空串，不抛）。 */
 function safeHomedir() {
@@ -117,28 +116,39 @@ async function readSubDirectories(abs) {
   return out.length > MAX_DIR_ENTRIES ? out.slice(0, MAX_DIR_ENTRIES) : out;
 }
 
-/**
- * 猜测图片 MIME 类型。
- * 附件对象是按 sha256 内容寻址存储的，文件名不带扩展名，
- * 所以按文件头 magic 判断（PNG / JPEG / GIF / WebP），都不匹配则回退 PNG。
- */
-function guessImageMediaType(hex, data) {
-  if (data !== undefined && data.length >= 12) {
-    if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) return 'image/png';
-    if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg';
-    if (data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return 'image/gif';
-    if (data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46
-      && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) return 'image/webp';
+/** 下载时只看少量文件头。内容寻址对象没有扩展名，不能猜成 PNG。 */
+function imageMediaTypeOfHead(head) {
+  if (head.subarray(0, 8).equals(PNG_SIGNATURE)) return 'image/png';
+  if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'image/jpeg';
+  const tag = head.toString('latin1', 0, 16);
+  if (tag.startsWith('GIF87a') || tag.startsWith('GIF89a')) return 'image/gif';
+  if (tag.startsWith('RIFF') && tag.slice(8, 12) === 'WEBP') return 'image/webp';
+  if (head.length >= 14 && tag.startsWith('BM') && head.readUInt16LE(6) === 0 && head.readUInt16LE(8) === 0) return 'image/bmp';
+  if (tag.slice(4, 8) === 'ftyp') {
+    if (/^(heic|heix|hevc|hevx|mif1|msf1)$/.test(tag.slice(8, 12))) return 'image/heic';
+    if (/^(avif|avis)$/.test(tag.slice(8, 12))) return 'image/avif';
   }
-  return 'image/png';
+  return '';
+}
+
+function videoMediaTypeOfHead(head) {
+  const tag = head.toString('latin1', 0, 16);
+  if (tag.startsWith('RIFF') && tag.slice(8, 12) === 'AVI ') return 'video/x-msvideo';
+  if (head.length >= 4 && head.readUInt32BE(0) === 0x1a45dfa3) {
+    return head.includes('webm') ? 'video/webm' : 'video/x-matroska';
+  }
+  if (tag.slice(4, 8) !== 'ftyp') return '';
+  const brand = tag.slice(8, 12);
+  if (brand === 'qt  ') return 'video/quicktime';
+  if (brand.startsWith('3gp')) return 'video/3gpp';
+  if (/^(isom|iso[2-9]|mp4[12]|avc1|M4V |MSNV|dash|hvc1|hev1)$/.test(brand)) return 'video/mp4';
+  return '';
 }
 
 /** 解析 PNG 头部里的宽高（IHDR 块固定紧跟签名）。拿不到返回 null，不抛。 */
 function parsePngDimensions(head) {
   if (head === undefined || head.length < 24) return null;
-  const isPng = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47
-    && head[4] === 0x0d && head[5] === 0x0a && head[6] === 0x1a && head[7] === 0x0a;
-  if (!isPng) return null;
+  if (!head.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
   const isIhdr = head[12] === 0x49 && head[13] === 0x48 && head[14] === 0x44 && head[15] === 0x52;
   if (!isIhdr) return null;
   const width = head.readUInt32BE(16);
@@ -198,19 +208,16 @@ async function readFileHead(file, bytes = IMAGE_HEAD_BYTES) {
 }
 
 /**
- * 从字节头识别图片并尽量取宽高。识别不出（非 PNG/JPEG/GIF/WebP）返回 null。
- * 注意：宽高只对 PNG/JPEG 有值（contract.md §9.1 只要求这两种魔数解析），
- * 其余图片 mediaType 照常识别，宽高填 0。
+ * 从字节头识别图片并尽量取宽高，识别不出时返回 null。
+ * 宽高只解析 PNG/JPEG（contract.md §9.1），其余图片宽高填 0。
  */
 function sniffImageHead(head) {
-  if (head === undefined || head.length < 8) return null;
-  const mediaType = guessImageMediaType('', head);
-  const png = parsePngDimensions(head);
-  if (png !== null) return { mediaType: 'image/png', width: png.width, height: png.height };
-  const jpeg = parseJpegDimensions(head);
-  if (jpeg !== null) return { mediaType: 'image/jpeg', width: jpeg.width, height: jpeg.height };
-  const isImageMagic = mediaType !== 'image/png' || (head[0] === 0x89 && head[1] === 0x50);
-  return isImageMagic ? { mediaType, width: 0, height: 0 } : null;
+  if (head === undefined) return null;
+  const mediaType = imageMediaTypeOfHead(head);
+  if (!mediaType) return null;
+  const dimensions = mediaType === 'image/png' ? parsePngDimensions(head)
+    : mediaType === 'image/jpeg' ? parseJpegDimensions(head) : null;
+  return { mediaType, width: dimensions?.width ?? 0, height: dimensions?.height ?? 0 };
 }
 
 /** 解码 X-File-Name（URL 编码），失败时原样返回；顺手剥掉目录成分。 */
@@ -1624,87 +1631,40 @@ export class DshAdapter {
   // ── 附件（图片 / 文件）─────────────────────────────────────────────────
 
   /**
-   * 读取一个图片附件的原始字节，供手机端渲染。
-   *
-   * 真实附件引用形状（已用本机会话日志核对，见 tools/scan-images.mjs）：
-   *   content block: { type:'image', attachment:{ attachmentId:'sha256:<hex>', mediaType, bytes, width, height, name } }
-   * 存储布局（本机实测）：$DSH_HOME/attachments/v1/objects/<sha256 前 2 位>/<sha256 剩余 62 位>
-   *
-   * 优先走 DSH 的 attachments 服务（readImage 会校验 id / 格式 / 字节长度 / 尺寸），
-   * 服务不可用或校验失败时退回直接读对象文件（同一份内容，只是少了校验）。
-   *
-   * @param {string} attachmentId 形如 sha256:<64 位 hex>
-   * @returns {Promise<{ data: Buffer, mediaType: string }>}
+   * 定位 DSH 内容寻址对象，仅探测文件头，不调用要求完整引用的 readImage，也不整包读入。
+   * 存储布局：$DSH_HOME/attachments/v1/{objects,file-objects}/<前两位>/<完整摘要>。
    */
-  async readImageAttachment(attachmentId) {
+  async objectAttachmentPath(attachmentId, mediaOnly) {
     const id = typeof attachmentId === 'string' ? attachmentId.trim() : '';
-    const hex = id.startsWith('sha256:') ? id.slice('sha256:'.length) : id;
-    if (!/^[0-9a-f]{64}$/i.test(hex)) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `附件 ID 非法：${id}`);
+    const hex = id.replace(/^sha256:/i, '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(hex)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '附件 ID 必须是 sha256 摘要');
     }
 
-    const service = this.optional('attachments');
-    if (service !== undefined && typeof service.readImage === 'function') {
+    const candidates = mediaOnly ? ['objects', 'file-objects'] : ['file-objects'];
+    for (const kind of candidates) {
+      const root = path.join(this.attachmentsRoot(), kind, hex.slice(0, 2));
+      const file = path.join(root, hex);
       try {
-        const stored = await service.readImage({
-          attachmentId: id,
-          mediaType: 'image/png',
-          bytes: 0,
-          width: 0,
-          height: 0,
-        });
-        const data = stored !== null && typeof stored === 'object' ? stored.data : undefined;
-        const ref = stored !== null && typeof stored === 'object' ? stored.ref : undefined;
-        const mediaType = ref !== null && typeof ref === 'object' && typeof ref.mediaType === 'string'
-          ? ref.mediaType
-          : '';
-        if (data instanceof Uint8Array && data.length > 0) {
-          return { data: Buffer.from(data), mediaType: mediaType.length > 0 ? mediaType : guessImageMediaType(hex) };
-        }
-      } catch (error) {
-        this.log(`attachments.readImage 失败，改读对象文件: ${error instanceof Error ? error.message : String(error)}`);
+        if (!(await fs.promises.stat(file)).isFile()) continue;
+        const head = await readFileHead(file, DOWNLOAD_HEAD_BYTES);
+        const mediaType = imageMediaTypeOfHead(head) || videoMediaTypeOfHead(head);
+        // 老客户端对不带 media: 的 video 也走 /api/attachments；仅在确认媒体后回退到文件库。
+        if (mediaOnly && kind === 'file-objects' && !mediaType) continue;
+        return { root, fileName: hex, mediaType: mediaType || 'application/octet-stream' };
+      } catch {
+        // 找不到或无法读取时继续查下一个对象库。
       }
     }
-
-    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
-    const file = path.join(home, 'attachments', 'v1', 'objects', hex.slice(0, 2), hex);
-    let data;
-    try {
-      data = await fs.promises.readFile(file);
-    } catch {
-      // 路由存在 + 鉴权通过 + 资源不存在 = 404，而不是 501（v3.1 修正，contract.md §5）
-      throw new BridgeError(ErrorCode.ATTACHMENT_NOT_FOUND, '图片附件不存在', {
-        detail: { attachmentId: id },
-      });
-    }
-    return { data, mediaType: guessImageMediaType(hex, data) };
+    throw new BridgeError(ErrorCode.ATTACHMENT_NOT_FOUND, '附件不存在', { detail: { attachmentId: id } });
   }
 
-  /**
-   * 读取一个通用文件附件的原始字节（工具结果里的 file 块）。
-   *
-   * 存储布局（dsh-attachment-local 源码核实）：$DSH_HOME/attachments/v1/file-objects/<hex 前 2 位>/<hex>
-   * 与图片对象分开存放，文件名不含扩展名；显示名随块下发，不在存储里。
-   *
-   * @param {string} attachmentId 形如 sha256:<64 位 hex>
-   * @returns {Promise<{ data: Buffer }>}
-   */
-  async readGenericAttachment(attachmentId) {
-    const id = typeof attachmentId === 'string' ? attachmentId.trim() : '';
-    const hex = id.startsWith('sha256:') ? id.slice('sha256:'.length) : id;
-    if (!/^[0-9a-f]{64}$/i.test(hex)) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `附件 ID 非法：${id}`);
-    }
+  imageAttachmentPath(attachmentId) {
+    return this.objectAttachmentPath(attachmentId, true);
+  }
 
-    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
-    const file = path.join(home, 'attachments', 'v1', 'file-objects', hex.slice(0, 2), hex);
-    let data;
-    try {
-      data = await fs.promises.readFile(file);
-    } catch {
-      throw new BridgeError(ErrorCode.ATTACHMENT_NOT_FOUND, '文件附件不存在', { detail: { attachmentId: id } });
-    }
-    return { data };
+  genericAttachmentPath(attachmentId) {
+    return this.objectAttachmentPath(attachmentId, false);
   }
 
   /**
@@ -1722,31 +1682,28 @@ export class DshAdapter {
    *
    * 结果缓存 60 秒（会话与工作区变化不频繁，避免每次请求都拉一遍列表）。
    *
-   * @returns {Promise<string[]>} 已 realpath 归一化的绝对目录（小写比较见 isInsideRoot）
+   * @returns {Promise<string[]>} 已 realpath 归一化的绝对目录
    */
   async mediaRoots() {
     const now = Date.now();
     if (this._mediaRoots !== null && now - this._mediaRoots.at < MEDIA_ROOTS_TTL) {
       return this._mediaRoots.roots;
     }
-    const raw = [];
-    const home = this.dshHome();
-    raw.push(path.join(home, 'dsh-imagegen'));
+    const raw = [path.join(this.dshHome(), 'dsh-imagegen')];
+    // 持久化会话头有 cwd，包括归档会话；控制面 summary 的部分版本不提供 cwd。
     try {
-      const sessions = await this.listSessions(false, { skipPreview: true });
-      for (const item of sessions) {
-        if (typeof item.cwd === 'string' && item.cwd.length > 0) raw.push(item.cwd);
-      }
-    } catch (error) {
-      this.log(`媒体白名单：读会话工作区失败: ${error instanceof Error ? error.message : String(error)}`);
+      const query = this.optional('sessionQuery');
+      const records = await query?.listSessions?.(newSignal(15000));
+      for (const record of Array.isArray(records) ? records : []) raw.push(record?.header?.cwd);
+    } catch {
+      // 仍可从控制面和工作区注册表取得目录。
     }
     try {
-      const archived = await this.listSessions(true, { skipPreview: true });
-      for (const item of archived) {
-        if (typeof item.cwd === 'string' && item.cwd.length > 0) raw.push(item.cwd);
-      }
-    } catch (error) {
-      // 归档列表失败不影响主流程
+      const controller = this.optional('sessionController');
+      const summary = await controller?.list?.({}, newSignal(15000));
+      for (const item of Array.isArray(summary?.items) ? summary.items : []) raw.push(item?.cwd);
+    } catch {
+      // 会话列表失败不影响已注册工作区。
     }
     try {
       const workspaces = await this.listWorkspaces();
@@ -1757,10 +1714,10 @@ export class DshAdapter {
       // 工作区列表失败不影响主流程
     }
     const roots = [];
-    for (const candidate of raw) {
+    for (const candidate of new Set(raw)) {
+      if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) continue;
       try {
-        // realpath：白名单里存的是真实路径，与目标文件比对时两边都归一化，
-        // 防止用符号链接把白名单外的目录「挂」进来。
+        // 根和目标都归一化，不能通过目录内的符号链接读取白名单外的文件。
         const real = await fs.promises.realpath(candidate);
         if (!roots.includes(real)) roots.push(real);
       } catch {
@@ -1771,16 +1728,10 @@ export class DshAdapter {
     return roots;
   }
 
-  /**
-   * 判断目标路径是否落在某个白名单根之内。
-   * Windows 路径大小写不敏感，统一转小写比较；同时防 `C:\a` 误匹配 `C:\ab`。
-   */
+  /** 按宿主文件系统的路径规则比对；不能在区分大小写的平台一律转小写。 */
   static isInsideRoot(target, root) {
-    const a = target.toLowerCase();
-    const b = root.toLowerCase();
-    if (a === b) return true;
-    const withSep = b.endsWith(path.sep) ? b : b + path.sep;
-    return a.startsWith(withSep);
+    const relative = path.relative(root, target);
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
   }
 
   /**
@@ -1798,85 +1749,62 @@ export class DshAdapter {
    *   字节从不进入会话。手机端加载不了电脑上的路径，所以由桥转出字节。
    *
    * @param {string} name 媒体 ID，例如 `abc.mp4` 或 `media:v1.ZDpc...`
-   * @returns {Promise<{ root: string, fileName: string }>}
+   * @returns {Promise<{ root: string, fileName: string, name: string, mediaType: string }>}
    */
   async mediaFilePath(name) {
-    const id = typeof name === 'string' ? name.trim() : '';
-    if (id.length === 0) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不能为空');
+    const id = typeof name === 'string' ? name : '';
+    // 保留新旧客户端的有/无 media: 前缀四种形态。
+    const value = id.startsWith('media:') ? id.slice('media:'.length) : id;
+    if (value.startsWith(MEDIA_ID_V1)) {
+      return this.resolveLocalMediaPath(value.slice(MEDIA_ID_V1.length));
     }
 
-    // v1 形态：`media:v1.<base64url>`；手机端 1.0.x 会把 `media:` 前缀剥掉再请求
-    // （ApiClient.mediaSrcOf → mediaUrl(id.substring(6))），所以这里两种都要认。
-    if (id.startsWith(MEDIA_ID_V1)) {
-      return this.resolveLocalMediaPath(id.slice(MEDIA_ID_V1.length));
+    if (!mediaKindOf(value) || value.startsWith('.') || /[\\/:\u0000-\u001f\u007f]/.test(value)) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不是受支持的文件名');
     }
-    if (id.startsWith('v1.')) {
-      return this.resolveLocalMediaPath(id.slice(3));
-    }
-
-    // v0：纯文件名形态
-    const fileName = id;
-    if (fileName !== path.basename(fileName) || fileName.includes('..')) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
-    }
-    const home = this.dshHome();
-    const file = path.join(home, 'dsh-imagegen', 'videos', 'files', fileName);
-    let stat = null;
+    let root;
     try {
-      stat = await fs.promises.stat(file);
+      root = await fs.promises.realpath(path.join(this.dshHome(), 'dsh-imagegen', 'videos', 'files'));
     } catch {
-      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在', { detail: { name: fileName } });
+      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在');
     }
-    if (stat.isDirectory()) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
-    }
-    return { root: path.dirname(file), fileName };
+    return this.localMediaDescriptor(path.join(root, value), [root]);
   }
 
-  /**
-   * 解码 `media:v1.` 后面的 base64url 绝对路径，校验白名单后返回可流式响应的位置。
-   *
-   * @param {string} encoded base64url(utf8 绝对路径)
-   */
+  /** 解码已有的 v1 路径标识，实际文件仍须通过白名单。 */
   async resolveLocalMediaPath(encoded) {
-    let absolute = '';
+    let absolute;
     try {
-      absolute = Buffer.from(encoded, 'base64url').toString('utf8');
+      if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error('无效编码');
+      const bytes = Buffer.from(encoded, 'base64url');
+      if (bytes.toString('base64url') !== encoded) throw new Error('无效编码');
+      absolute = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
     } catch {
       throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 解码失败');
     }
-    if (absolute.length === 0 || !path.isAbsolute(absolute)) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不是绝对路径');
+    if (!path.isAbsolute(absolute) || /[\u0000-\u001f\u007f]/.test(absolute)
+      || (process.platform === 'win32' && absolute.slice(2).includes(':'))) {
+      throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 不是有效绝对路径');
     }
-    // 先按扩展名挡一道：只服务白名单内的媒体类型，避免把任意文件（密钥、配置）当媒体转出
-    if (mediaKindOf(absolute).length === 0) {
+    if (!mediaKindOf(absolute)) {
       throw new BridgeError(ErrorCode.INVALID_PARAM, '媒体 ID 指向的不是支持的媒体类型');
     }
-    const fileName = path.basename(absolute);
+    return this.localMediaDescriptor(absolute, await this.mediaRoots());
+  }
 
-    let real = '';
-    let stat = null;
+  async localMediaDescriptor(absolute, roots) {
+    const name = path.basename(absolute);
+    const missing = () => new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在', { detail: { name } });
     try {
-      real = await fs.promises.realpath(absolute);
-      stat = await fs.promises.stat(real);
+      const real = await fs.promises.realpath(absolute);
+      const mediaType = mediaMimeOf(real);
+      if (!mediaKindOf(real) || !roots.some((root) => DshAdapter.isInsideRoot(real, root))
+        || !(await fs.promises.stat(real)).isFile()) throw missing();
+      return { root: path.dirname(real), fileName: path.basename(real), name, mediaType };
     } catch {
-      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不存在', { detail: { name: fileName } });
+      // 不区分文件不存在与不在白名单内。
+      throw missing();
     }
-    if (!stat.isFile()) {
-      throw new BridgeError(ErrorCode.INVALID_PARAM, `媒体文件名非法：${fileName}`);
-    }
-
-    const roots = await this.mediaRoots();
-    const allowed = roots.some((root) => DshAdapter.isInsideRoot(real, root));
-    if (!allowed) {
-      // 越权读取：路径本身合法但不在任何会话工作区 / 生成目录内，按 404 处理，
-      // 不向客户端透露「文件存在但你没权限」这一信息。
-      throw new BridgeError(ErrorCode.MEDIA_NOT_FOUND, '媒体文件不在允许的目录内', { detail: { name: fileName } });
-    }
-    // 用 realpath 之后的文件名：源路径可能是符号链接，交给 send 时必须是真实文件名，
-    // 否则 send(root, 链接名) 会因为目录里没有这个名字而 404。
-    return { root: path.dirname(real), fileName: path.basename(real) };
   }
 
   // ── 附件上传（v3.1，contract.md §9.1）───────────────────────────────────

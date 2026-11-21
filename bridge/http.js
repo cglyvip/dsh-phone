@@ -41,14 +41,73 @@ const TUNNEL_HOST = 'dsh-phone-bridge-tunnel';
 const PAIR_MAX_FAILURES = 20;
 const PAIR_LOCK_MS = 15 * 60 * 1000;
 
-/** 极简路由表：method + 正则 → handler(params, ctx) */
+/** 极简路由表：仅附件 GET 路由可复用同一处理器支持 HEAD。 */
 function matchRoute(routes, method, pathname) {
   for (const route of routes) {
-    if (route.method !== method) continue;
+    if (route.method !== method && !(method === 'HEAD' && route.head === true)) continue;
     const match = route.pattern.exec(pathname);
     if (match !== null) return { route, params: match.slice(1) };
   }
   return null;
+}
+
+function attachmentIdOf(raw) {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new BridgeError(ErrorCode.INVALID_PARAM, '附件 ID 的 URL 编码无效');
+  }
+}
+
+/** 文件名仅用于响应头展示，不用于选择磁盘对象或 MIME。 */
+function attachmentDisposition(kind, value) {
+  const name = String(value ?? '').replace(/\\/g, '/').split('/').at(-1)
+    .replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 255).toWellFormed();
+  if (name.length === 0) return kind;
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${kind}; filename*=UTF-8''${encoded}`;
+}
+
+/** 三条下载路由统一走流式文件响应，不为 Range 预读整个文件。 */
+function sendAttachment(request, response, file) {
+  response.setHeader('Cache-Control', 'private, max-age=86400');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  if (file.mediaType) response.setHeader('Content-Type', file.mediaType);
+  if (file.disposition === 'attachment' || file.name) {
+    response.setHeader('Content-Disposition', attachmentDisposition(file.disposition ?? 'inline', file.name));
+  }
+  // HTTP Range 只用于 GET；HEAD 返回完整资源的头，不打开文件流。
+  if (request.method === 'HEAD') delete request.headers.range;
+  const stream = send(request, '/' + encodeURIComponent(file.fileName), {
+    root: file.root,
+    index: false,
+    dotfiles: 'deny',
+    acceptRanges: true,
+  });
+  stream.on('error', (error) => {
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
+    if (error.status === 416) {
+      response.statusCode = 416;
+      response.setHeader('Content-Length', '0');
+      response.end();
+      return;
+    }
+    response.removeHeader('Content-Disposition');
+    response.removeHeader('Content-Range');
+    response.removeHeader('ETag');
+    response.removeHeader('Last-Modified');
+    if (error.status === 403 || error.status === 404) {
+      sendJson(response, 404, errorBody(new BridgeError(file.notFound, '附件不存在')).body);
+      return;
+    }
+    const status = error.status ?? 500;
+    const code = status < 500 ? ErrorCode.INVALID_PARAM : ErrorCode.INTERNAL_ERROR;
+    sendJson(response, status, errorBody(new BridgeError(code, '无法读取附件')).body);
+  });
+  stream.pipe(response);
 }
 
 /**
@@ -131,9 +190,9 @@ export function createHttpHandler(deps) {
     { method: 'PUT', pattern: /^\/api\/settings\/model$/, handler: handlePutDefaultModel },
     { method: 'GET', pattern: /^\/api\/workspaces$/, handler: handleListWorkspaces },
     { method: 'GET', pattern: /^\/api\/dirs$/, handler: handleListDirs },
-    { method: 'GET', pattern: /^\/api\/attachments\/([^/]+)$/, handler: handleAttachment, raw: true },
-    { method: 'GET', pattern: /^\/api\/media\/([^/]+)$/, handler: handleMediaFile, raw: true },
-    { method: 'GET', pattern: /^\/api\/files\/([^/]+)$/, handler: handleFileAttachment, raw: true },
+    { method: 'GET', pattern: /^\/api\/attachments\/([^/]+)$/, handler: handleAttachment, head: true },
+    { method: 'GET', pattern: /^\/api\/media\/([^/]+)$/, handler: handleMediaFile, head: true },
+    { method: 'GET', pattern: /^\/api\/files\/([^/]+)$/, handler: handleFileAttachment, head: true },
     { method: 'GET', pattern: /^\/api\/sync$/, handler: handleSync },
     { method: 'GET', pattern: /^\/api\/search$/, handler: handleSearch },
   ];
@@ -416,44 +475,26 @@ export function createHttpHandler(deps) {
     return adapter.search(query.get('q') ?? '');
   }
 
-  /**
-   * 取图片附件的原始字节，直接以二进制响应返回（不走 JSON）。
-   * 手机端 <Image> 组件可以直接把 URL 交给它渲染，省掉一次 base64 解码。
-   */
-  async function handleAttachment(params, request) {
-    const raw = Array.isArray(params) && params.length > 0 ? params[0] : '';
-    const attachmentId = decodeURIComponent(raw);
-    const image = await adapter.readImageAttachment(attachmentId);
-    return {
-      __raw: true,
-      status: 200,
-      mediaType: image.mediaType,
-      data: image.data,
-    };
+  /** 图片对象以原始二进制响应返回，不走 JSON 或 base64。 */
+  async function handleAttachment(params, request, query) {
+    const file = await adapter.imageAttachmentPath(attachmentIdOf(params[0]));
+    return { ...file, name: query.get('name'), notFound: ErrorCode.ATTACHMENT_NOT_FOUND };
   }
 
-  /** 已落盘的媒体文件（AI 生成视频），按文件名转出字节。 */
+  /** 已落盘的媒体文件（生图/生视频、会话交付），流式转出字节。 */
   async function handleMediaFile(params) {
-    const raw = Array.isArray(params) && params.length > 0 ? params[0] : '';
-    const name = decodeURIComponent(raw);
-    const media = await adapter.mediaFilePath(name);
-    return {
-      __stream: true,
-      root: media.root,
-      fileName: media.fileName,
-    };
+    const file = await adapter.mediaFilePath(attachmentIdOf(params[0]));
+    return { ...file, notFound: ErrorCode.MEDIA_NOT_FOUND };
   }
 
-  /** 通用文件附件（工具结果里的 file 块），按内容寻址转出字节。 */
-  async function handleFileAttachment(params) {
-    const raw = Array.isArray(params) && params.length > 0 ? params[0] : '';
-    const attachmentId = decodeURIComponent(raw);
-    const stored = await adapter.readGenericAttachment(attachmentId);
+  /** 通用文件对象只按摘要定位，文件名可由消息块带到下载请求。 */
+  async function handleFileAttachment(params, request, query) {
+    const file = await adapter.genericAttachmentPath(attachmentIdOf(params[0]));
     return {
-      __raw: true,
-      status: 200,
-      mediaType: 'application/octet-stream',
-      data: stored.data,
+      ...file,
+      name: query.get('name'),
+      disposition: 'attachment',
+      notFound: ErrorCode.ATTACHMENT_NOT_FOUND,
     };
   }
 
@@ -598,8 +639,9 @@ export function createHttpHandler(deps) {
       const origin = request.headers.origin;
       if (typeof origin === 'string' && allowOrigins.includes(origin)) {
         response.setHeader('Access-Control-Allow-Origin', origin);
-        response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-        response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+        response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, If-Range');
+        response.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS');
+        response.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Range, Content-Disposition, ETag');
       }
     }
     if (method === 'OPTIONS') {
@@ -645,32 +687,8 @@ export function createHttpHandler(deps) {
         tokens.verify(token, clientIp(request));
       }
       const result = await route.handler(params, request, url.searchParams);
-      // 流式文件响应（视频等）：交给 send 处理 Range / 条件请求 / MIME
-      if (result !== null && typeof result === 'object' && result.__stream === true) {
-        response.setHeader('Cache-Control', 'private, max-age=86400');
-        const stream = send(request, '/' + encodeURIComponent(result.fileName), {
-          root: result.root,
-          index: false,
-          dotfiles: 'deny',
-          acceptRanges: true,
-        });
-        stream.on('error', (streamError) => {
-          if (!response.headersSent) {
-            response.statusCode = streamError.status ?? 500;
-          }
-          response.end();
-        });
-        stream.pipe(response);
-        return;
-      }
-      // 原始字节响应（图片等）：不包 JSON，直接写二进制
-      if (result !== null && typeof result === 'object' && result.__raw === true) {
-        const body = Buffer.isBuffer(result.data) ? result.data : Buffer.from(result.data ?? []);
-        response.statusCode = typeof result.status === 'number' ? result.status : 200;
-        response.setHeader('Content-Type', result.mediaType ?? 'application/octet-stream');
-        response.setHeader('Content-Length', String(body.length));
-        response.setHeader('Cache-Control', 'private, max-age=86400');
-        response.end(body);
+      if (route.head === true) {
+        sendAttachment(request, response, result);
         return;
       }
       const statusCode = method === 'POST' && pathname.endsWith('/messages') ? 202 : 200;

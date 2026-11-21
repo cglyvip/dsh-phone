@@ -10,7 +10,7 @@
 import { WebSocket } from 'ws';
 
 const TOKEN = typeof process.env.RELAY_TOKEN === 'string' ? process.env.RELAY_TOKEN.trim() : '';
-const BASE = (process.argv[2] ?? process.env.RELAY_BASE ?? 'wss://relay.cgly.eu.org').replace(/\/+$/, '');
+const BASE = (process.argv[2] ?? process.env.RELAY_BASE ?? 'wss://relay.cgly.top').replace(/\/+$/, '');
 
 if (TOKEN.length === 0) {
   console.error('缺少 RELAY_TOKEN 环境变量。');

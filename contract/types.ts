@@ -11,7 +11,7 @@
 
 export const CONTRACT_VERSION = 3 as const;
 export const MIN_CONTRACT_VERSION = 3 as const;
-export const BRIDGE_VERSION = '3.8.3';
+export const BRIDGE_VERSION = '3.8.4';
 export const PROTOCOL = 'dsh-phone-bridge';
 
 // ── 通用 ────────────────────────────────────────────────────────────────
@@ -50,19 +50,18 @@ export interface ErrorBody {
 // ── 消息内容块 ──────────────────────────────────────────────────────────
 
 /**
- * image / video 块的 attachmentId 有四种形态，客户端按前缀分流即可：
- *   - `sha256:<64hex>`        → GET /api/attachments/:id（v3.1 上传附件）
- *   - `media:<文件名>`         → GET /api/media/:id（v3.0 生视频，仅 $DSH_HOME/dsh-imagegen/videos/files）
- *   - `media:v1.<base64url>`  → GET /api/media/:id（v3.7 会话工作区任意媒体文件的绝对路径）
- * 客户端取 URL 时不要把 `media:` 前缀带进路径，桥端两种形态都接受。
- * 白名单外的路径一律 404 MEDIA_NOT_FOUND，不区分「不存在」与「无权限」。
+ * 下载路由按块 type 与 ID 前缀分流：
+ *   - image/video + `sha256:<64hex>` → /api/attachments/:id
+ *   - image/video + `media:<文件名>` 或 `media:v1.<base64url>` → /api/media/:id
+ *   - file + `sha256:<64hex>` → /api/files/:id（即使显示为图片或视频也不改下载路由）
+ * 访问 /api/media 可剥掉 `media:` 前缀，新旧形态均兼容；白名单外的路径返回 404 MEDIA_NOT_FOUND。
  */
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
-  | { type: 'image'; attachmentId: string; mediaType: string; width: number; height: number; name: string }
-  | { type: 'video'; attachmentId: string; mediaType: string; width: number; height: number; name: string }
-  | { type: 'file'; attachmentId: string; name: string; bytes: number }
+  | { type: 'image'; attachmentId: string; mediaType: string; width: number; height: number; name: string; bytes?: number }
+  | { type: 'video'; attachmentId: string; mediaType: string; width: number; height: number; name: string; bytes?: number }
+  | { type: 'file'; attachmentId: string; name: string; bytes: number; mediaType?: string }
   | { type: 'toolCall'; id: string; name: string; arguments: string }
   | { type: 'toolAddition'; toolName: string }
   | { type: 'toolRemoval'; toolName: string };
@@ -326,9 +325,12 @@ export const REST_ROUTES = [
   { method: 'GET', path: '/api/sessions/:id/permission', auth: true, note: 'v3.1 §9.5 当前权限模式 {mode, approval}' },
   { method: 'PUT', path: '/api/sessions/:id/permission', auth: true, note: 'v3.4 §9.6 运行时改权限 {mode?, approval?} 任意组合（approval: every-step↔ask / auto↔never）；成功后广播 session.updated' },
   { method: 'POST', path: '/api/uploads', auth: true, note: 'v3.1 原始字节流上传，X-File-Name（URL编码）+ X-Media-Type 头，上限 200MB' },
-  { method: 'GET', path: '/api/attachments/:id', auth: true, note: 'v3.1 图片附件字节（sha256:<64hex>），支持 Range' },
-  { method: 'GET', path: '/api/media/:id', auth: true, note: 'v3.7 媒体字节：media:v1.<base64url(绝对路径)> 指向会话工作区/工作区/生图目录内的文件；老形态 media:<文件名> 仍兼容。白名单外或非媒体扩展名一律 404/400，支持 Range' },
-  { method: 'GET', path: '/api/files/:id', auth: true, note: 'v3.1 通用文件附件字节（sha256:<64hex>）' },
+  { method: 'GET', path: '/api/attachments/:id', auth: true, note: '图片或摘要视频（sha256:<64hex>），支持 Range' },
+  { method: 'HEAD', path: '/api/attachments/:id', auth: true },
+  { method: 'GET', path: '/api/media/:id', auth: true, note: 'media:v1.<base64url(绝对路径)>，兼容 media:<文件名> 与剥前缀形态，检查白名单，支持 Range' },
+  { method: 'HEAD', path: '/api/media/:id', auth: true },
+  { method: 'GET', path: '/api/files/:id', auth: true, note: '普通文件附件（sha256:<64hex>），支持 Range，可用 ?name= 获取文件名响应头' },
+  { method: 'HEAD', path: '/api/files/:id', auth: true },
   { method: 'GET', path: '/api/models', auth: true },
   { method: 'GET', path: '/api/settings/model', auth: true },
   { method: 'PUT', path: '/api/settings/model', auth: true },

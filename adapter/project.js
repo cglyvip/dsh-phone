@@ -18,72 +18,75 @@
 
 import path from 'node:path';
 
-/**
- * 本机绝对路径（Windows 盘符 / UNC），手机端无法加载。
- * 生成类工具会把落盘路径写进正文（`![生成图片](C:\...\x.png)`），
- * 直接透传会让手机只看到一串路径，所以这里统一剥掉。
- */
-function isLocalAbsolutePath(value) {
-  if (typeof value !== 'string' || value.length === 0) return false;
+function isWindowsAbsolutePath(value) {
   return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\');
 }
 
-const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
-/** 普通 markdown 链接 `[文字](<路径>)`：交付类工具常用它给出视频/图片（`!` 开头的图片语法除外）。 */
-const MARKDOWN_LINK = /(?<!!)\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
-/** 任意 markdown 链接/图片语法（抽取媒体时两者都要看）。 */
-const MARKDOWN_ANY_LINK = /!?\[([^\]]*)\]\(<?([^)\n]+?)>?\)/g;
+function localFileName(value) {
+  return isWindowsAbsolutePath(value) ? path.win32.basename(value) : path.basename(value);
+}
 
-/** 媒体扩展名白名单（只有这些才当作可下发的媒体，避免把普通文档当视频）。 */
-const VIDEO_EXT = /\.(mp4|mov|m4v|webm|mkv|avi|3gp)$/i;
-const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|heic)$/i;
+/** 尖括号内的交付路径可以含空格、括号和 #，不能按普通 URL 切掉。 */
+const MARKDOWN_ANY_LINK = /(!?)\[([^\]\r\n]*)\]\((?:<([^>\r\n]+)>|((?:[^()\r\n]|\([^()\r\n]*\))+))\)/g;
+const PRESENTED_LINE = /^[^\S\r\n]*Presented[^\S\r\n]+([^\r\n]+)$/gim;
 
-/** 媒体扩展名 → MIME（手机端 Video/Image 组件据此选解码器）。 */
+function markdownTarget(bracketed, plain) {
+  if (bracketed !== undefined) return bracketed;
+  try {
+    return decodeURIComponent(plain);
+  } catch {
+    return plain;
+  }
+}
+
+function presentedTarget(target) {
+  const value = target.trim();
+  const close = { '<': '>', '`': '`', "'": "'", '"': '"' }[value[0]];
+  return close && value.endsWith(close) ? value.slice(1, -1) : value;
+}
+
+/** 本地路径和媒体扩展名白名单；路径中的 #、% 等字符是文件名的一部分。 */
 const MEDIA_MIME = {
   mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
   mkv: 'video/x-matroska', avi: 'video/x-msvideo', '3gp': 'video/3gpp',
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic',
+  webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic', avif: 'image/avif',
+};
+const FILE_MIME = {
+  pdf: 'application/pdf', zip: 'application/zip', json: 'application/json',
+  txt: 'text/plain', md: 'text/markdown', csv: 'text/csv',
 };
 
-/** 按扩展名判断媒体类型：'video' | 'image' | ''（不是媒体）。 */
+function extensionOf(value) {
+  return /\.([a-z0-9]+)$/i.exec(String(value ?? ''))?.[1]?.toLowerCase() ?? '';
+}
+
+export function mediaMimeOf(value) {
+  const extension = extensionOf(value);
+  return Object.hasOwn(MEDIA_MIME, extension) ? MEDIA_MIME[extension] : '';
+}
+
 export function mediaKindOf(value) {
-  const text = String(value ?? '').split('?')[0].split('#')[0];
-  if (VIDEO_EXT.test(text)) return 'video';
-  if (IMAGE_EXT.test(text)) return 'image';
-  return '';
+  return mediaMimeOf(value).split('/')[0];
 }
 
-/** 按扩展名猜 MIME，猜不到给空串（手机端会按块类型兜底）。 */
-function mediaMimeOf(value) {
-  const text = String(value ?? '').split('?')[0].split('#')[0];
-  const dot = text.lastIndexOf('.');
-  if (dot < 0) return '';
-  return MEDIA_MIME[text.slice(dot + 1).toLowerCase()] ?? '';
+function fileMimeOf(name) {
+  const extension = extensionOf(name);
+  return mediaMimeOf(name) || (Object.hasOwn(FILE_MIME, extension) ? FILE_MIME[extension] : '');
 }
 
-/**
- * 去掉指向本机磁盘的图片 markdown（图片本身改由 image 块渲染），
- * 并把本机媒体链接降级为可读文字：
- *   `[demo](<deliver/demo.mp4>)` → `demo`
- * 媒体字节已由 media 块承载，正文里再留一串路径只会让手机用户困惑。
- * 只处理媒体扩展名且没有 http(s) 等 scheme 的目标，普通文档链接保持原样。
- */
-function stripLocalMediaPaths(text) {
+/** 只替换已能投影成独立块的本机媒体链接；普通文档、外链仍保留原文。 */
+function stripLocalMediaPaths(text, cwd) {
   if (typeof text !== 'string' || text.length === 0) return '';
   return text
-    .replace(MARKDOWN_IMAGE, (whole, alt, target) => (isLocalAbsolutePath(target) ? '' : whole))
-    .replace(MARKDOWN_LINK, (whole, label, target) => {
-      const clean = String(target ?? '').trim();
-      if (clean.length === 0 || /^[a-z][a-z0-9+.-]*:/i.test(clean)) return whole;
-      if (mediaKindOf(clean).length === 0) return whole;
-      const name = String(label ?? '').trim();
-      return name.length > 0 ? name : path.basename(clean);
+    .replace(MARKDOWN_ANY_LINK, (whole, image, label, bracketed, plain) => {
+      const absolute = resolveLocalPath(markdownTarget(bracketed, plain), cwd);
+      if (!mediaKindOf(absolute)) return whole;
+      return image ? '' : (label.trim() || localFileName(absolute));
     })
-    // present 工具逐行输出 `Presented <绝对路径>`：媒体已由块承载，正文只留文件名
-    .replace(/^\s*Presented\s+(.+?)\s*$/gim, (whole, target) => {
-      const clean = String(target ?? '').replace(/^[`'"]|[`'"]$/g, '').trim();
-      return mediaKindOf(clean).length > 0 ? path.basename(clean) : whole;
+    .replace(PRESENTED_LINE, (whole, target) => {
+      const absolute = resolveLocalPath(presentedTarget(target), cwd);
+      return mediaKindOf(absolute) ? localFileName(absolute) : whole;
     })
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -108,13 +111,14 @@ function fileNameOfUrl(url) {
  */
 function resolveLocalPath(target, cwd) {
   const value = typeof target === 'string' ? target.trim() : '';
-  if (value.length === 0) return '';
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return ''; // http(s):// 等外链，桥无法代理
-  if (value.startsWith('#')) return '';
-  if (isLocalAbsolutePath(value)) return path.normalize(value);
-  const base = typeof cwd === 'string' ? cwd.trim() : '';
-  if (base.length === 0) return '';
-  return path.resolve(base, value);
+  if (!value || value.startsWith('#') || value.startsWith('//') || /[\u0000-\u001f\u007f]/.test(value)) return '';
+  if (isWindowsAbsolutePath(value)) return path.win32.normalize(value);
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return '';
+  const base = typeof cwd === 'string' ? cwd : '';
+  if (isWindowsAbsolutePath(base)) return path.win32.resolve(base, value);
+  if (path.posix.isAbsolute(value)) return path.posix.normalize(value);
+  if (!path.posix.isAbsolute(base)) return '';
+  return path.posix.resolve(base, value);
 }
 
 /**
@@ -163,22 +167,18 @@ function extractMediaBlocks(text, cwd = '') {
     blocks.push(block);
   };
 
-  /** 把一条「可能是本机路径」的引用变成 image/video 块。 */
-  const pushLocal = (target, label) => {
+  /** 链接标题留在正文；附件块保留真正的文件名和扩展名。 */
+  const pushLocal = (target) => {
     const absolute = resolveLocalPath(target, cwd);
-    if (absolute.length === 0) return;
     const kind = mediaKindOf(absolute);
-    if (kind.length === 0) return;
-    const id = encodeLocalMediaId(absolute);
-    if (id.length === 0) return;
-    const name = String(label ?? '').trim() || path.basename(absolute);
+    if (!kind) return;
     push({
       type: kind,
-      attachmentId: id,
+      attachmentId: encodeLocalMediaId(absolute),
       mediaType: mediaMimeOf(absolute),
       width: 0,
       height: 0,
-      name,
+      name: localFileName(absolute),
     });
   };
 
@@ -223,18 +223,13 @@ function extractMediaBlocks(text, cwd = '') {
   }
 
   // ② markdown 链接 / 图片语法（助手正文最常见的交付形态）
-  MARKDOWN_ANY_LINK.lastIndex = 0;
-  let link;
-  while ((link = MARKDOWN_ANY_LINK.exec(text)) !== null) {
-    pushLocal(link[2], link[1]);
+  for (const [, , , bracketed, plain] of text.matchAll(MARKDOWN_ANY_LINK)) {
+    pushLocal(markdownTarget(bracketed, plain));
   }
 
   // ③ `Presented <路径>` 逐行输出（present 工具）
-  const PRESENTED_LINE = /^\s*Presented\s+(.+?)\s*$/gim;
-  let presented;
-  while ((presented = PRESENTED_LINE.exec(text)) !== null) {
-    const target = presented[1].replace(/^[`'"]|[`'"]$/g, '').trim();
-    pushLocal(target, '');
+  for (const [, target] of text.matchAll(PRESENTED_LINE)) {
+    pushLocal(presentedTarget(target));
   }
 
   return blocks;
@@ -260,45 +255,33 @@ function friendlyToolText(text) {
   return text;
 }
 
-/** 把 DSH ContentBlock 转成手机线格式块。 */
-export function blockToWire(block) {
+function isAttachmentBlock(block) {
+  return block.type === 'image' || block.type === 'video' || block.type === 'file';
+}
+
+/** 把 DSH ContentBlock 转成手机线格式块；附件只发引用与元数据。 */
+export function blockToWire(block, cwd) {
   if (block === null || typeof block !== 'object') return null;
   const type = block.type;
-  if (type === 'text') {
-    return { type: 'text', text: stripLocalMediaPaths(typeof block.text === 'string' ? block.text : '') };
+  if (type === 'text' || type === 'reasoning') {
+    const text = typeof block.text === 'string' ? block.text : '';
+    return { type, text: typeof cwd === 'string' ? stripLocalMediaPaths(text, cwd) : text };
   }
-  if (type === 'reasoning') {
-    return { type: 'reasoning', text: stripLocalMediaPaths(typeof block.text === 'string' ? block.text : '') };
-  }
-  if (type === 'image') {
-    const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : {};
+  if (isAttachmentBlock(block)) {
+    const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : block;
+    const attachmentId = typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '';
+    if (!attachmentId.trim()) return null;
+    const name = typeof attachment.name === 'string' ? attachment.name : '';
+    const declared = typeof attachment.mediaType === 'string' ? attachment.mediaType.trim() : '';
+    const mediaType = declared && declared !== 'application/octet-stream'
+      ? declared : (fileMimeOf(name) || declared);
+    const bytes = Number.isSafeInteger(attachment.bytes) && attachment.bytes >= 0 ? attachment.bytes : undefined;
+    if (type === 'file') return { type, attachmentId, name, bytes: bytes ?? 0, ...(mediaType ? { mediaType } : {}) };
     return {
-      type: 'image',
-      attachmentId: typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '',
-      mediaType: typeof attachment.mediaType === 'string' ? attachment.mediaType : '',
+      type, attachmentId, name, mediaType,
       width: typeof attachment.width === 'number' ? attachment.width : 0,
       height: typeof attachment.height === 'number' ? attachment.height : 0,
-      name: typeof attachment.name === 'string' ? attachment.name : '',
-    };
-  }
-  if (type === 'file') {
-    const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : {};
-    return {
-      type: 'file',
-      attachmentId: typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '',
-      name: typeof attachment.name === 'string' ? attachment.name : '',
-      bytes: typeof attachment.bytes === 'number' ? attachment.bytes : 0,
-    };
-  }
-  if (type === 'video') {
-    const attachment = block.attachment && typeof block.attachment === 'object' ? block.attachment : {};
-    return {
-      type: 'video',
-      attachmentId: typeof attachment.attachmentId === 'string' ? attachment.attachmentId : '',
-      mediaType: typeof attachment.mediaType === 'string' ? attachment.mediaType : '',
-      width: typeof attachment.width === 'number' ? attachment.width : 0,
-      height: typeof attachment.height === 'number' ? attachment.height : 0,
-      name: typeof attachment.name === 'string' ? attachment.name : '',
+      ...(bytes !== undefined ? { bytes } : {}),
     };
   }
   if (type === 'tool-call') {
@@ -318,14 +301,33 @@ export function blockToWire(block) {
   return null;
 }
 
-function blocksToWire(blocks) {
+function blocksToWire(blocks, cwd) {
   if (!Array.isArray(blocks)) return [];
   const out = [];
   for (const block of blocks) {
-    const wire = blockToWire(block);
+    const wire = blockToWire(block, cwd);
     if (wire !== null) out.push(wire);
   }
   return out;
+}
+
+function mergeAttachments(blocks, attachments) {
+  if (attachments.length === 0) return;
+  const keyOf = (block) => `${block.type}|${block.attachmentId}`;
+  const seen = new Set(blocks.filter(isAttachmentBlock).map(keyOf));
+  for (const attachment of attachments) {
+    const key = keyOf(attachment);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    blocks.push(attachment);
+  }
+}
+
+/** 实时与历史共用投影规则：结构化块优先，文字交付形态补齐媒体引用。 */
+function deliveredBlocks(content, text, cwd) {
+  const blocks = blocksToWire(content, cwd);
+  mergeAttachments(blocks, extractMediaBlocks(text, cwd));
+  return blocks;
 }
 
 /** 从块数组里抽纯文本（供列表摘要 / 通知用）。 */
@@ -474,35 +476,10 @@ export function projectEvents(events, options = {}) {
   let currentStep = 0;
   /** 会话工作区：相对媒体路径（`deliver/demo.mp4`）按它展开成绝对路径。 */
   const cwd = typeof options.cwd === 'string' ? options.cwd : '';
-
-  /**
-   * 把媒体块挂到「同 turn 最后一条助手消息」上。
-   *
-   * 为什么要提升：工具结果的媒体块按契约挂在 role:'tool' 消息里，
-   * 而手机端（鸿蒙 1.0.x）的工具行只渲染 args/resultText、完全不看 blocks，
-   * 所以只挂在 tool 上用户永远看不到视频。助手消息的媒体是必渲染的，
-   * 提升一份过去即可让老客户端无需升级就能显示。
-   * 找不到同 turn 助手消息时（例如只有工具事件）就只留在 tool 上。
-   */
-  const promoteToAssistant = (mediaBlocks) => {
-    if (mediaBlocks.length === 0) return;
-    let target = null;
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role !== 'assistant') continue;
-      if (message.turn !== currentTurn) break;
-      target = message;
-      break;
-    }
-    if (target === null) return;
-    if (!Array.isArray(target.blocks)) target.blocks = [];
-    for (const media of mediaBlocks) {
-      const exists = target.blocks.some(
-        (block) => block.type === media.type && block.attachmentId === media.attachmentId,
-      );
-      if (!exists) target.blocks.push(media);
-    }
-  };
+  // 旧鸿蒙工具行不渲染附件。历史保留工具附件，再补到同轮最后一条助手消息；
+  // 等整轮投影完再补，工具结果先于助手消息时也不会漏，还能去掉助手已有的相同引用。
+  const assistantByTurn = new Map();
+  const toolAttachmentsByTurn = new Map();
 
   for (const event of Array.isArray(events) ? events : []) {
     if (event === null || typeof event !== 'object') continue;
@@ -582,34 +559,29 @@ export function projectEvents(events, options = {}) {
     if (type === 'assistant/message') {
       const message = data.message && typeof data.message === 'object' ? data.message : {};
       const source = message.source && typeof message.source === 'object' ? message.source : {};
-      const blocks = blocksToWire(message.content);
       for (const block of Array.isArray(message.content) ? message.content : []) {
         if (block && block.type === 'tool-call' && typeof block.id === 'string' && typeof block.name === 'string') {
           toolNames.set(block.id, block.name);
         }
       }
-      // 助手正文里的媒体链接（`[demo](<deliver/demo.mp4>)`）转成媒体块，
-      // 正文里的路径同时降级成可读文字，手机端才不会只看到一串本地路径。
-      const assistantText = textOfBlocks(message.content);
-      for (const media of extractMediaBlocks(assistantText, cwd)) {
-        if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
-          blocks.push(media);
-        }
-      }
-      messages.push({
+      const text = textOfBlocks(message.content);
+      const turn = typeof data.turn === 'number' ? data.turn : currentTurn;
+      const projected = {
         id: typeof message.id === 'string' ? message.id : `a_${seq}`,
         seq,
         role: 'assistant',
         time,
-        turn: typeof data.turn === 'number' ? data.turn : currentTurn,
+        turn,
         step: typeof data.step === 'number' ? data.step : currentStep,
-        blocks,
-        text: stripLocalMediaPaths(textOfBlocks(message.content)),
+        blocks: deliveredBlocks(message.content, text, cwd),
+        text: stripLocalMediaPaths(text, cwd),
         provider: typeof source.provider === 'string' ? source.provider : '',
         model: typeof source.model === 'string' ? source.model : '',
         usage: usageToWire(data.usage),
         interrupted: data.interrupted === true,
-      });
+      };
+      messages.push(projected);
+      assistantByTurn.set(turn, projected);
       continue;
     }
 
@@ -625,30 +597,24 @@ export function projectEvents(events, options = {}) {
       const callId = typeof message.toolCallId === 'string'
         ? message.toolCallId
         : (typeof data.callId === 'string' ? data.callId : '');
-      const blocks = blocksToWire(message.content);
       const rawText = textOfBlocks(message.content);
-      const friendlyText = friendlyToolText(rawText);
-      // 生成类工具（生图/生视频/交付）只返回媒体引用或路径，没有可渲染的块；
-      // 这里把引用补成 image / video 块，手机端才能真正看到素材。
-      const mediaBlocks = [];
-      for (const media of extractMediaBlocks(rawText, cwd)) {
-        if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
-          blocks.push(media);
-        }
-        mediaBlocks.push(media);
+      const blocks = deliveredBlocks(message.content, rawText, cwd);
+      const turn = typeof data.turn === 'number' ? data.turn : currentTurn;
+      for (const block of blocks) {
+        if (!isAttachmentBlock(block)) continue;
+        if (!toolAttachmentsByTurn.has(turn)) toolAttachmentsByTurn.set(turn, []);
+        toolAttachmentsByTurn.get(turn).push(block);
       }
-      // 手机端工具行不渲染 blocks，同 turn 助手消息上再挂一份（见 promoteToAssistant）。
-      promoteToAssistant(mediaBlocks);
       const error = data.error && typeof data.error === 'object' ? data.error : undefined;
       messages.push({
         id: typeof message.id === 'string' ? message.id : `t_${seq}`,
         seq,
         role: 'tool',
         time,
-        turn: typeof data.turn === 'number' ? data.turn : currentTurn,
+        turn,
         step: typeof data.step === 'number' ? data.step : currentStep,
         blocks,
-        text: stripLocalMediaPaths(friendlyText),
+        text: stripLocalMediaPaths(friendlyToolText(rawText), cwd),
         callId,
         toolName: toolNames.get(callId) ?? '',
         isError: message.isError === true || error !== undefined,
@@ -676,6 +642,10 @@ export function projectEvents(events, options = {}) {
     }
   }
 
+  for (const [turn, attachments] of toolAttachmentsByTurn) {
+    const assistant = assistantByTurn.get(turn);
+    if (assistant !== undefined) mergeAttachments(assistant.blocks, attachments);
+  }
   return { messages: trimMessages(messages), turns, meta, title, titleUpdatedAt };
 }
 
@@ -799,13 +769,7 @@ export function eventToWire(sessionId, event, options = {}) {
   if (type === 'assistant/message') {
     const message = data.message && typeof data.message === 'object' ? data.message : {};
     const source = message.source && typeof message.source === 'object' ? message.source : {};
-    const blocks = blocksToWire(message.content);
-    // 助手正文里的媒体链接 → 媒体块（与历史投影同一套规则）
-    for (const media of extractMediaBlocks(textOfBlocks(message.content), cwd)) {
-      if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
-        blocks.push(media);
-      }
-    }
+    const text = textOfBlocks(message.content);
     return {
       name: 'message.done',
       sessionId,
@@ -814,8 +778,8 @@ export function eventToWire(sessionId, event, options = {}) {
       payload: {
         id: typeof message.id === 'string' ? message.id : `a_${seq}`,
         role: 'assistant',
-        blocks,
-        text: stripLocalMediaPaths(textOfBlocks(message.content)),
+        blocks: deliveredBlocks(message.content, text, cwd),
+        text: stripLocalMediaPaths(text, cwd),
         provider: typeof source.provider === 'string' ? source.provider : '',
         model: typeof source.model === 'string' ? source.model : '',
         usage: usageToWire(data.usage),
@@ -827,14 +791,7 @@ export function eventToWire(sessionId, event, options = {}) {
   }
   if (type === 'tool/result') {
     const message = data.message && typeof data.message === 'object' ? data.message : {};
-    const blocks = blocksToWire(message.content);
-    const rawText = textOfBlocks(message.content);
-    const friendlyText = friendlyToolText(rawText);
-    for (const media of extractMediaBlocks(rawText, cwd)) {
-      if (!blocks.some((block) => block.type === media.type && block.attachmentId === media.attachmentId)) {
-        blocks.push(media);
-      }
-    }
+    const text = textOfBlocks(message.content);
     const error = data.error && typeof data.error === 'object' ? data.error : undefined;
     return {
       name: 'message.part',
@@ -845,9 +802,9 @@ export function eventToWire(sessionId, event, options = {}) {
         id: typeof message.id === 'string' ? message.id : `t_${seq}`,
         role: 'tool',
         kind: 'tool-result',
-        blocks,
-        text: stripLocalMediaPaths(friendlyText),
-        callId: typeof message.toolCallId === 'string' ? message.toolCallId : '',
+        blocks: deliveredBlocks(message.content, text, cwd),
+        text: stripLocalMediaPaths(friendlyToolText(text), cwd),
+        callId: typeof message.toolCallId === 'string' ? message.toolCallId : (data.callId ?? ''),
         isError: message.isError === true || error !== undefined,
         turn: data.turn ?? 0,
         step: data.step ?? 0,

@@ -61,9 +61,9 @@ export class EventHub {
         ? session.id
         : '';
       // 会话工作区：媒体相对路径（`deliver/E9.mp4`）要按它展开成绝对路径才能转出字节。
-      const cwd = session !== null && typeof session === 'object' && typeof session.cwd === 'string'
+      const cwd = typeof session?.cwd === 'string' && session.cwd.length > 0
         ? session.cwd
-        : '';
+        : (typeof session?.header?.cwd === 'string' ? session.header.cwd : '');
       const envelope = eventToWire(sessionId, event, { cwd });
       if (envelope === null) return;
       this.publish(envelope.name, sessionId, envelope.timestamp, envelope.payload, envelope.seq);

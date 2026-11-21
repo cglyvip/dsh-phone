@@ -1,6 +1,6 @@
 {
   "name": "dsh-phone-bridge",
-  "version": "3.8.3",
+  "version": "3.8.4",
   "description": "DeepSeek Harness 手机端桥接插件：会话全量管理 / 流式对话 / 模型设置（局域网 + 公网）",
   "type": "module",
   "main": "index.js",

@@ -4,9 +4,15 @@
 > 类型定义见同目录 `types.ts`；鸿蒙端的镜像类型在
 > `dsh-harmony/entry/src/main/ets/contract/Contract.ets`（必须与本文件同步）。
 
-- 桥版本：`3.8.3`
+- 桥版本：`3.8.4`
 - 契约版本：`3`（`MIN_CONTRACT_VERSION = 3`）
 - 协议名：`dsh-phone-bridge`
+
+### 3.8.4 修复：媒体与附件传输（详见 §3.3）
+
+实时 `message.done` / `message.part` 与历史一致下发 `image` / `video` / `file` 引用，不内联附件字节。
+历史把工具附件补到同轮最后一条助手消息。文件块新增可选 `mediaType`，图片与视频块在有元数据时带 `bytes`。
+路由和 ID 分流不变，三条下载路由统一支持鉴权 `HEAD` 与 `GET` 分段。中转 `/p/<配对码>` 路径前缀和二进制帧协议不变。
 
 ### 3.8.3 修复：中转自动换码落盘
 
@@ -228,24 +234,29 @@ Content-Type: application/json
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/attachments/:id` | 图片附件字节（`sha256:<64hex>`），支持 Range |
-| GET | `/api/files/:id` | 通用文件附件字节（`sha256:<64hex>`） |
-| GET | `/api/media/:id` | 媒体字节，支持 Range（v3.7，见下） |
+| GET / HEAD | `/api/attachments/:id` | `sha256:<64hex>` 图片对象；兼容无 `media:` 前缀的视频，按文件头从文件对象库取回 |
+| GET / HEAD | `/api/files/:id` | `file` 块的 `sha256:<64hex>` 文件对象，未知类型用 `application/octet-stream` |
+| GET / HEAD | `/api/media/:id` | `media:` 引用的图片 / 视频；兼容 URL 里剥掉 `media:` 前缀 |
 
-`/api/media/:id` 接受四种 `id`（URL 编码后放进路径，带 `?token=`）：
+三路都要鉴权。客户端优先使用 `Authorization: Bearer …`；桥保留 `?token=` 供旧客户端兼容。走中转时，手机完整请求仍带 `/p/<8 位路由码>`，只由中转剥掉此前缀。
+`HEAD` 返回完整资源的响应头、无响应体。`GET` 支持单段字节范围，返回 `206` 与 `Content-Range`；合法但不可满足的范围返回 `416` 与 `Content-Range: bytes */<总长度>`。
+媒体路径带原始文件名；SHA 对象无存储文件名，客户端用内容块的 `name`，也可传 `?name=<URL 编码的名称>` 取 `Content-Disposition: …; filename*=UTF-8''…`，不会用该名称选择磁盘路径。
+响应体为原始字节，不在消息或 JSON 中放 base64 文件内容。桥的 200 MiB 和中转规范的 20 MB 均指上传请求体上限，不能据此推断生产中转下载上限。中转单次桥端请求仍有 55 秒兜底超时。
+
+`/api/media/:id` 接受四种 `id`（URL 编码后放进路径）：
 
 | 形态 | 指向 |
 |---|---|
 | `<文件名>.mp4` | `$DSH_HOME/dsh-imagegen/videos/files/<文件名>`（v3.0 生视频，禁止目录层级） |
 | `media:<文件名>` | 同上，兼容老客户端的原样透传 |
 | `media:v1.<base64url>` | base64url 解码出的**绝对路径**，须落在白名单根内（v3.7） |
-| `v1.<base64url>` | 同上，兼容剥掉 `media:` 前缀的客户端（鸿蒙 `mediaSrcOf()` 即如此） |
+| `v1.<base64url>` | 同上，兼容剥掉 `media:` 前缀的客户端 |
 
 白名单根 = `$DSH_HOME/dsh-imagegen` + 全部会话 `cwd`（含归档）+ 全部工作区路径，
-逐个 `realpath` 归一化后按前缀比对（大小写不敏感、补路径分隔符）。判定顺序：
-空 id → `400`；非图片/视频扩展名 → `400 INVALID_PARAM`；相对路径 → `400`；
-`realpath` 失败 / 非普通文件 / 不在白名单内 → `404 MEDIA_NOT_FOUND`。
-成功响应带 `Cache-Control: private, max-age=86400` 与正确的 `Content-Type`。
+根目录和文件分别以 `realpath` 归一化，再按宿主路径规则检查目录边界。v0 文件名只访问 `videos/files` 目录。
+空 ID、非图片/视频扩展名和 v1 相对路径返回 `400 INVALID_PARAM`；`realpath` 失败、非普通文件或不在白名单内返回 `404 MEDIA_NOT_FOUND`。
+普通文档必须使用 DSH 的结构化 `file` 引用；写在文字里的任意本机文档路径不会变成下载入口。
+成功响应带 `Cache-Control: private, max-age=86400` 与 `Content-Type`。
 
 ---
 
@@ -389,6 +400,7 @@ Content-Type: application/json
 | 3.8.1 | 安全修复（§3.8.1）：`/pair` 与 `/` 也校验 `x-dsh-relay`，配对页不再能经 `/p/<配对码>` 从公网打开（此前会泄露 6 位配对码并可直接换令牌）；纯修复，契约不变 |
 | 3.8.2 | 修复（§3.8.2）：`POST /api/transport/mode` 补透传 `relay` 参数，配对页「开启中转」不再报「中转密钥不能为空」；纯修复，契约不变 |
 | 3.8.3 | 修复（§3.8.3）：中转自动换码真正落盘——`TransportManager` 构造时接收 `persistFile`，换码后写回 `transport.json`（3.8.1 的回调调用了不存在的函数，异常被吞）；纯修复，契约不变 |
+| 3.8.4 | 修复（§3.3）：结构化图片/视频/文件下发与历史补齐，保留本机媒体文件名，对三个下载路由统一支持 HEAD/Range，并限制中转下载发送队列；契约版本仍为 3 |
 
 ---
 
@@ -565,7 +577,7 @@ ngrok:
   authtoken: ''            # v3.3 托管 ngrok，只落盘不回显
   staticDomain: ''
 relay:                     # v3.8 官方中转
-  endpoint: 'wss://relay.cgly.eu.org'   # 留空用默认值
+  endpoint: 'wss://relay.cgly.top'    # 留空用默认值
   token: ''                # 中转密钥，只落盘不回显
   pairCode: ''             # 8 位 [a-z0-9]，留空自动生成
 ```

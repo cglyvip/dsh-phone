@@ -23,7 +23,7 @@ import { WebSocket } from 'ws';
 export const RELAY_MARKER_HEADER = 'x-dsh-relay';
 
 /** 默认中转服务地址：用户不必自己找地址，开箱即用。 */
-export const DEFAULT_RELAY_ENDPOINT = 'wss://relay.cgly.eu.org';
+export const DEFAULT_RELAY_ENDPOINT = 'wss://relay.cgly.top';
 
 /** 配对码：8 位 [a-z0-9]，与服务端 PAIR_RE 一致。 */
 const PAIR_CODE_RE = /^[a-z0-9]{8}$/;
@@ -83,7 +83,7 @@ export function relayPublicUrl(endpoint, pairCode) {
 export class RelayChannel {
   /**
    * @param {{
-   *   endpoint: string,          // 例如 wss://relay.cgly.eu.org
+   *   endpoint: string,          // 例如 wss://relay.cgly.top
    *   token: string,             // 中转密钥（RELAY_TOKEN）
    *   pairCode: string,          // 8 位配对码
    *   localPort: number,         // 本机桥端口
@@ -384,29 +384,19 @@ export class RelayChannel {
     }
   }
 
-  sendBinary(buffer) {
-    const socket = this.ws;
-    if (socket === null || socket.readyState !== 1) return false;
-    try {
-      socket.send(buffer);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /** 控制帧 +（可选）紧跟的二进制帧，必须连续同步发出，服务端按此配对。 */
+  /** 同步排入控制帧和二进制帧，等写出再读下一块，避免整个下载堆在 WS 发送队列。 */
   sendWithBody(frame, buffer) {
     const socket = this.ws;
-    if (socket === null || socket.readyState !== 1) return false;
-    try {
-      socket.send(JSON.stringify(frame));
-      if (buffer !== undefined && buffer.length > 0) socket.send(buffer);
-      return true;
-    } catch (error) {
-      this.log(`relay: 发送失败 ${messageOf(error)}`);
-      return false;
-    }
+    if (socket === null || socket.readyState !== 1) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      try {
+        socket.send(JSON.stringify(frame));
+        socket.send(buffer, (error) => resolve(!error));
+      } catch (error) {
+        this.log(`relay: 发送失败 ${messageOf(error)}`);
+        resolve(false);
+      }
+    });
   }
 
   // ───────────────────────── HTTP 转发 ─────────────────────────
@@ -421,17 +411,24 @@ export class RelayChannel {
   handleHttpRequest(msg) {
     const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
     const path = typeof msg.path === 'string' ? msg.path : '';
-    const method = typeof msg.method === 'string' ? msg.method : 'GET';
+    const method = typeof msg.method === 'string' ? msg.method.toUpperCase() : 'GET';
     const bodyLength = Number.isInteger(msg.bodyLength) && msg.bodyLength > 0 ? msg.bodyLength : 0;
-    if (requestId.length === 0 || path.length === 0) return;
-    if (this.pending.has(requestId)) return;
+    if (requestId.length === 0 || this.pending.has(requestId)) return;
+    // 中转协议送来已剥掉 /p/<码> 的根相对路径，保留编码段和原查询串。
+    if (!path.startsWith('/') || path.startsWith('//') || /[\\#\u0000- \u007f]/.test(path)) {
+      this.send({ type: 'res', requestId, status: 400, headers: {}, bodyLength: 0, end: true });
+      return;
+    }
 
-    const headers = { ...(msg.headers !== null && typeof msg.headers === 'object' ? msg.headers : {}) };
-    delete headers.host;
-    delete headers.connection;
-    delete headers['content-length'];
-    delete headers['transfer-encoding'];
+    const headers = Object.create(null);
+    for (const [name, value] of Object.entries(msg.headers ?? {})) {
+      const key = name.toLowerCase();
+      if (key === 'host' || key === 'connection' || key === 'content-length' || key === 'transfer-encoding') continue;
+      headers[key] = value;
+    }
     headers[RELAY_MARKER_HEADER] = this.marker;
+    // fetch 会自动解压响应，回环要求原始表示，避免字节与 Content-Length 不一致。
+    headers['accept-encoding'] = 'identity';
 
     // 真实来源 IP：nginx 在服务端写入 x-real-ip，中转服务原样带过来。
     // 桥的配对防爆破按这个计，否则所有中转用户会共用 127.0.0.1 一个计数器。
@@ -457,7 +454,7 @@ export class RelayChannel {
         if (typeof entry.abort === 'function') entry.abort();
       } catch {}
       this.send({ type: 'res', requestId, status: 504, headers: {}, bodyLength: 0, end: true });
-      this.log(`relay: 本机请求超时 ${method} ${path}`);
+      this.log(`relay: 本机 ${method} 请求超时`);
     }, REQUEST_TIMEOUT_MS);
     if (typeof timer.unref === 'function') timer.unref();
     entry.timer = timer;
@@ -474,7 +471,11 @@ export class RelayChannel {
   async dispatchHttp(entry, body) {
     const { requestId, method, path, headers } = entry;
     const controller = new AbortController();
+    const isCurrent = () => this.pending.get(requestId) === entry;
     entry.abort = () => controller.abort();
+    let reader;
+    let headersSent = false;
+    let complete = false;
     try {
       const response = await this.fetchImpl(`http://127.0.0.1:${this.localPort}${path}`, {
         method,
@@ -483,74 +484,61 @@ export class RelayChannel {
         signal: controller.signal,
         redirect: 'manual',
       });
+      if (!isCurrent()) return;
 
       const outHeaders = {};
       for (const [key, value] of response.headers.entries()) {
-        const lk = key.toLowerCase();
-        // 这两个由 Node 自己管；其余（含 content-length / range / etag）原样透传
-        if (lk === 'transfer-encoding' || lk === 'connection') continue;
+        // 连接级响应头由中转端管理；长度、Range、ETag 和文件名原样透传。
+        if (key === 'transfer-encoding' || key === 'connection') continue;
         outHeaders[key] = value;
       }
-
-      const noBody = response.body === null
-        || method === 'HEAD'
-        || response.status === 204
-        || response.status === 304;
-
-      // 第一帧带响应头；空响应体时直接就结束
-      this.send({
-        type: 'res',
-        requestId,
-        status: response.status,
-        headers: outHeaders,
-        bodyLength: 0,
-        end: noBody,
+      const noBody = response.body === null || method === 'HEAD';
+      headersSent = this.send({
+        type: 'res', requestId, status: response.status, headers: outHeaders, bodyLength: 0, end: noBody,
       });
-      if (noBody) return;
+      if (!headersSent || noBody) {
+        complete = noBody;
+        return;
+      }
 
-      const reader = response.body.getReader();
-      for (;;) {
-        // 条目已被超时清理：停止读数，别继续往服务端灌没人要的帧
-        if (!this.pending.has(requestId)) {
-          try {
-            await reader.cancel();
-          } catch {}
+      reader = response.body.getReader();
+      while (isCurrent()) {
+        const { done, value } = await reader.read();
+        if (!isCurrent()) return;
+        if (done) {
+          complete = true;
+          this.send({ type: 'res', requestId, status: response.status, headers: {}, bodyLength: 0, end: true });
           return;
         }
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value !== undefined && value.length > 0) {
-          // 控制帧与二进制帧必须紧挨着发（中间不能有 await），
-          // 服务端用一个 binaryExpect 变量配对，交错会把 A 的数据写进 B 的响应。
-          this.sendWithBody({
-            type: 'res',
-            requestId,
-            status: response.status,
-            headers: {},
-            bodyLength: value.length,
-            end: false,
-          }, Buffer.from(value));
+        if (value?.length > 0) {
+          const written = await this.sendWithBody({
+            type: 'res', requestId, status: response.status, headers: {}, bodyLength: value.length, end: false,
+          }, value);
+          if (!written) return;
         }
       }
-      this.send({ type: 'res', requestId, status: response.status, headers: {}, bodyLength: 0, end: true });
     } catch (error) {
-      const detail = Buffer.from(JSON.stringify({
-        error: { code: 'BRIDGE_ERROR', message: `桥处理失败：${messageOf(error)}` },
-      }), 'utf8');
-      this.sendWithBody({
-        type: 'res',
-        requestId,
-        status: 502,
-        headers: {
-          'content-type': 'application/json; charset=utf-8',
-          'content-length': String(detail.length),
-        },
-        bodyLength: detail.length,
-        end: true,
-      }, detail);
-      this.log(`relay: 本机请求失败 ${method} ${path}：${messageOf(error)}`);
-    } finally {
+      // 超时或断连已结束的请求不能重复写；开始传文件后也不能把 JSON 拼进文件。
+      if (!isCurrent()) return;
       this.finishEntry(requestId);
+      if (headersSent || method === 'HEAD') {
+        this.send({ type: 'res', requestId, status: 502, headers: {}, bodyLength: 0, end: true });
+      } else {
+        const detail = Buffer.from(JSON.stringify({ error: { code: 'BRIDGE_ERROR', message: '桥处理请求失败' } }));
+        await this.sendWithBody({
+          type: 'res', requestId, status: 502,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(detail.length),
+          },
+          bodyLength: detail.length, end: true,
+        }, detail);
+      }
+      this.log(`relay: 本机 ${method} 请求失败：${messageOf(error)}`);
+    } finally {
+      reader?.releaseLock();
+      if (!complete) controller.abort();
+      if (isCurrent()) this.finishEntry(requestId);
     }
   }
 

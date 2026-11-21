@@ -11,11 +11,11 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { EventEmitter, once } from 'node:events';
+import { existsSync, readFileSync, readdirSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WebSocket } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 
 import { apply, normalize } from './index.js';
 import { lastChatMessage, previewOfBlocks, projectEvents, toPreviewText } from './adapter/project.js';
@@ -26,7 +26,7 @@ import { BRIDGE_VERSION } from './shared/version.js';
 import { FRP_PROVIDERS, pairHtml } from './pair.js';
 import { TUNNEL_PROVIDERS } from './shared/tunnel-providers.js';
 import { normalizeTransportConfig, TransportManager } from './bridge/transport.js';
-import { RelayChannel, RELAY_MARKER_HEADER, normalizeEndpoint, relayPublicUrl } from './bridge/relay.js';
+import { DEFAULT_RELAY_ENDPOINT, RelayChannel, RELAY_MARKER_HEADER, normalizeEndpoint, relayPublicUrl } from './bridge/relay.js';
 
 /** v3.1 上传上限（与 adapter/dsh.js 的 MAX_UPLOAD_BYTES 一致）。 */
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
@@ -175,8 +175,9 @@ async function runRelayScenarios() {
     emit(event, ...args) {
       for (const fn of [...(this.handlers.get(event) ?? [])]) fn(...args);
     }
-    send(data) {
+    send(data, callback) {
       this.sent.push(data);
+      callback?.();
     }
     close() {
       if (this.closed) return;
@@ -669,7 +670,273 @@ async function waitForPort(runtimeFile, timeoutMs = 5000) {
   throw new Error(`等待 runtime.json 超时: ${runtimeFile}`);
 }
 
+/** 回环中转只实现 fixture 用到的协议，不接入生产地址和用户凭据。 */
+async function startAttachmentRelay() {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const pairCode = crypto.randomBytes(4).toString('hex');
+  const prefix = `/p/${pairCode}`;
+  const pending = new Map();
+  const phones = new Map();
+  const wss = new WebSocketServer({ noServer: true });
+  let bridge;
+  let expectedBody;
+  let binaryFrames = 0;
+  const server = http.createServer((req, res) => {
+    if (!req.url?.startsWith(`${prefix}/`) || bridge?.readyState !== WebSocket.OPEN) {
+      res.writeHead(404).end();
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    pending.set(requestId, res);
+    res.once('close', () => pending.delete(requestId));
+    bridge.send(JSON.stringify({
+      type: 'req', requestId, method: req.method, path: req.url.slice(prefix.length),
+      headers: req.headers, bodyLength: 0,
+    }));
+  });
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/bridge' && req.headers.authorization === `Bearer ${token}`) {
+      wss.handleUpgrade(req, socket, head, (upstream) => {
+        upstream.on('message', (raw, binary) => {
+          if (binary) {
+            assert.ok(expectedBody, '二进制帧必须紧跟有 bodyLength 的控制帧');
+            const { res, length, end } = expectedBody;
+            expectedBody = undefined;
+            assert.equal(raw.length, length, '二进制帧长度必须与声明一致');
+            binaryFrames += 1;
+            if (end) res.end(raw);
+            else res.write(raw);
+            return;
+          }
+          assert.equal(expectedBody, undefined, '等待二进制帧时不能被控制帧打断');
+          const frame = JSON.parse(raw);
+          if (frame.type === 'register') {
+            assert.ok(frame.pairCode === pairCode && frame.role === 'bridge', '中转必须使用本轮随机路由码注册');
+            bridge = upstream;
+            upstream.send(JSON.stringify({ type: 'registered', pairCode }));
+          } else if (frame.type === 'ping') {
+            upstream.send(JSON.stringify({ type: 'pong' }));
+          } else if (frame.type === 'res') {
+            const res = pending.get(frame.requestId);
+            assert.ok(res, '中转 HTTP 帧必须归属对应请求');
+            assert.equal(frame.payload, undefined, 'HTTP 附件不得用 JSON/base64 封装');
+            if (!res.headersSent) res.writeHead(frame.status, frame.headers);
+            if (frame.bodyLength > 0) expectedBody = { res, length: frame.bodyLength, end: frame.end };
+            else if (frame.end) res.end();
+          } else if (frame.type === 'ws-out') {
+            const phone = phones.get(frame.connId);
+            if (phone?.readyState === WebSocket.OPEN) {
+              phone.send(Buffer.from(frame.payload, 'base64'), { binary: frame.binary });
+            }
+          }
+        });
+      });
+      return;
+    }
+    if (url.pathname === `${prefix}/ws` && bridge?.readyState === WebSocket.OPEN) {
+      wss.handleUpgrade(req, socket, head, (phone) => {
+        const connId = crypto.randomUUID();
+        phones.set(connId, phone);
+        bridge.send(JSON.stringify({ type: 'ws-open', connId, path: '/ws', search: url.search }));
+        phone.once('close', () => {
+          phones.delete(connId);
+          if (bridge.readyState === WebSocket.OPEN) bridge.send(JSON.stringify({ type: 'ws-close', connId }));
+        });
+      });
+      return;
+    }
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  });
+  const listening = once(server, 'listening');
+  server.listen(0, '127.0.0.1');
+  await listening;
+  const { port } = server.address();
+  return {
+    endpoint: `ws://127.0.0.1:${port}`, base: `http://127.0.0.1:${port}${prefix}`, port, token, pairCode,
+    ready: () => bridge?.readyState === WebSocket.OPEN,
+    binaryFrames: () => binaryFrames,
+    async close() {
+      for (const socket of wss.clients) socket.terminate();
+      wss.close();
+      await new Promise((resolve) => {
+        server.close(resolve);
+        server.closeAllConnections();
+      });
+    },
+  };
+}
+
+async function runAttachmentFixture() {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-bridge-attachment-fixture-'));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  let relay;
+  let phone;
+  const disposers = [];
+  try {
+    const cwd = join(home, '独立会话目录');
+    const mediaName = '视频 #1 (验收)%.mp4';
+    const relativeMedia = `交付/${mediaName}`;
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000000020001e221bc330000000049454e44ae426082', 'hex');
+    // 只验证原始字节传输和 MIME，不声明下面的 MP4 文件头是可播放视频。
+    const mp4 = Buffer.from('00000018667479706d703432000000006d70343269736f6d000102fefc', 'hex');
+    const stage = (directory, name, bytes) => {
+      const hex = crypto.createHash('sha256').update(bytes).digest('hex');
+      const root = join(home, 'attachments', 'v1', directory, hex.slice(0, 2));
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, hex), bytes);
+      return { attachmentId: `sha256:${hex}`, name, bytes: bytes.length };
+    };
+    const image = stage('objects', '截图 #1.png', png);
+    const video = stage('file-objects', mediaName, mp4);
+    const file = stage('file-objects', '发布报告 #2 (示例)%.txt', Buffer.alloc(21 * 1024 * 1024, 0x61));
+    mkdirSync(join(cwd, '交付'), { recursive: true });
+    writeFileSync(join(cwd, relativeMedia), mp4);
+    const legacyDir = join(home, 'dsh-imagegen', 'videos', 'files');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(join(legacyDir, mediaName), mp4);
+
+    const refs = [
+      { type: 'image', attachment: { ...image, width: 1, height: 1, data: '不下发夹具内的内联数据' } },
+      { type: 'video', attachment: video },
+      { type: 'file', attachment: file },
+    ];
+    const events = [];
+    const header = { id: 'fixture-attachments', createdAt: 1, cwd };
+    const ctx = makeFakeCtx();
+    ctx.effect = (setup) => { disposers.push(setup()); };
+    ctx.__services.sessionController.list = async () => ({ items: [{ sessionId: header.id, blank: true }] });
+    ctx.__services.sessionQuery.listSessions = async () => [{ header }];
+    ctx.__services.sessionQuery.readSession = async () => ({ session: header, events: events.slice() });
+    ctx.__services.workspaceRegistry.list = async () => [];
+    relay = await startAttachmentRelay();
+    apply(ctx, {
+      port: 0, host: '127.0.0.1', logLevel: 'silent', tokenFile: join(home, 'tokens.json'),
+      tunnelMode: 'relay', relay: { endpoint: relay.endpoint, token: relay.token, pairCode: relay.pairCode },
+    });
+    const { port } = await waitForPort(join(home, 'runtime.json'));
+    await waitForCondition(relay.ready, Boolean, 5000, '回环中转注册');
+    const pairing = await request(port, 'GET', '/api/pairing-code');
+    const paired = await request(port, 'POST', '/api/pair', { body: { code: pairing.json.code, clientName: '附件夹具' } });
+    assert.equal(paired.status, 200);
+    const token = paired.json.token;
+    const bearer = { Authorization: `Bearer ${token}` };
+    const local = `http://127.0.0.1:${port}`;
+    const relayUrl = (route) => `${relay.base}${route}`;
+    const phoneUrl = `${relay.base.replace('http:', 'ws:')}/ws?token=${encodeURIComponent(token)}`;
+    phone = new WebSocket(phoneUrl);
+    // WS 必须经真正的 RelayChannel 和真实桥认证，由假宿主提供合成事件。
+    await waitFor(phone, (frame) => frame.type === 'hello');
+    const observedTool = waitFor(phone, (frame) => frame.type === 'message.part' && frame.payload.kind === 'tool-result');
+    const observedAssistant = waitFor(phone, (frame) => frame.type === 'message.done');
+    const emit = (type, data) => {
+      const seq = events.length + 1;
+      const event = { type, data, seq, time: seq };
+      events.push(event);
+      ctx.__emit('session/event', { id: header.id, header }, event);
+    };
+    emit('turn/start', { turn: 1 });
+    emit('tool/result', { turn: 1, callId: 'fixture-tool', message: { id: 'tool', role: 'tool', content: refs } });
+    emit('assistant/message', { turn: 1, message: { id: 'assistant', role: 'assistant', content: [
+      refs[0], { type: 'text', text: `[播放](<${relativeMedia}>)` },
+    ] } });
+    emit('turn/end', { turn: 1, reason: { kind: 'stop' } });
+    const [tool, assistant] = await Promise.all([observedTool, observedAssistant]);
+    const kinds = (blocks) => blocks.filter((block) => block.attachmentId).map((block) => block.type);
+    assert.deepEqual(kinds(tool.payload.blocks), ['image', 'video', 'file']);
+    assert.ok(!JSON.stringify(tool).includes('不下发夹具内的内联数据'), '事件不得携带附件字节');
+    assert.deepEqual(tool.payload.blocks.map((block) => block.mediaType), ['image/png', 'video/mp4', 'text/plain']);
+    assert.deepEqual(tool.payload.blocks.map((block) => block.bytes), [png.length, mp4.length, file.bytes]);
+    const localVideo = assistant.payload.blocks.find((block) => block.type === 'video');
+    assert.equal(localVideo?.name, mediaName, '真实文件名不能被 Markdown 标题替代');
+    assert.equal(assistant.payload.text, '播放');
+    const historyResponse = await fetch(relayUrl(`/api/sessions/${header.id}/messages`), { headers: bearer });
+    assert.equal(historyResponse.status, 200);
+    const history = await historyResponse.json();
+    assert.deepEqual(history.messages.find((item) => item.role === 'tool').blocks, tool.payload.blocks);
+    const restored = history.messages.find((item) => item.role === 'assistant').blocks;
+    assert.deepEqual(kinds(restored), ['image', 'video', 'video', 'file'], '历史助手只合并同轮未重复附件');
+    assert.ok(restored.some((block) => block.attachmentId === localVideo.attachmentId));
+    pass('真实桥与本地中转下发结构化图片/视频/文件，历史合并同轮附件');
+
+    const imagePath = `/api/attachments/${encodeURIComponent(image.attachmentId)}`;
+    const shaVideoPath = `/api/attachments/${encodeURIComponent(video.attachmentId)}`;
+    const mediaPath = `/api/media/${encodeURIComponent(localVideo.attachmentId.slice('media:'.length))}`;
+    const filePath = `/api/files/${encodeURIComponent(file.attachmentId)}`;
+    for (const [route, bytes, mediaType] of [
+      [imagePath, png.length, 'image/png'], [shaVideoPath, mp4.length, 'video/mp4'],
+      [mediaPath, mp4.length, 'video/mp4'], [filePath, file.bytes, 'application/octet-stream'],
+    ]) {
+      const denied = await fetch(relayUrl(route), { method: 'HEAD' });
+      assert.equal(denied.status, 401, 'HEAD 与 GET 必须使用相同的令牌认证');
+      const head = await fetch(relayUrl(route), { method: 'HEAD', headers: { ...bearer, Range: 'bytes=1-3' } });
+      assert.equal(head.status, 200);
+      assert.equal(head.headers.get('content-length'), String(bytes));
+      assert.equal(head.headers.get('content-type'), mediaType);
+      assert.equal(head.headers.get('accept-ranges'), 'bytes');
+      assert.equal((await head.arrayBuffer()).byteLength, 0);
+    }
+    const noPrefix = await fetch(`http://127.0.0.1:${relay.port}${mediaPath}`, { headers: bearer });
+    assert.equal(noPrefix.status, 404, '手机请求中转时必须保留 /p/<配对码>');
+    const localOnly = await fetch(relayUrl('/api/pairing-code'), { headers: bearer });
+    assert.equal(localOnly.status, 403, '真实中转标记必须隔离仅本机接口');
+    await localOnly.arrayBuffer();
+    const wrongToken = await fetch(relayUrl(`${imagePath}?token=${crypto.randomBytes(12).toString('hex')}`));
+    assert.equal(wrongToken.status, 401);
+    await wrongToken.arrayBuffer();
+    const queryToken = `?token=${encodeURIComponent(token)}`;
+    const checks = await Promise.all([
+      fetch(relayUrl(`${imagePath}${queryToken}`), { headers: { Range: 'bytes=1-5' } }),
+      fetch(relayUrl(`${mediaPath}${queryToken}`), { headers: { Range: 'bytes=-5' } }),
+      fetch(relayUrl(`${filePath}?name=${encodeURIComponent(file.name)}`), { headers: { ...bearer, Range: 'bytes=-5' } }),
+    ]);
+    const expected = [[png.subarray(1, 6), 1, 5, png.length], [mp4.subarray(-5), mp4.length - 5, mp4.length - 1, mp4.length],
+      [Buffer.alloc(5, 0x61), file.bytes - 5, file.bytes - 1, file.bytes]];
+    for (const [index, response] of checks.entries()) {
+      const [body, first, last, size] = expected[index];
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-range'), `bytes ${first}-${last}/${size}`);
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), body);
+    }
+    assert.match(checks[1].headers.get('content-disposition'), /^inline; filename\*=UTF-8''/);
+    assert.equal(decodeURIComponent(checks[1].headers.get('content-disposition').split("''")[1]), mediaName);
+    assert.equal(decodeURIComponent(checks[2].headers.get('content-disposition').split("''")[1]), file.name);
+    const invalidRange = await fetch(relayUrl(mediaPath), { headers: { ...bearer, Range: 'bytes=999-' } });
+    assert.equal(invalidRange.status, 416);
+    assert.equal(invalidRange.headers.get('content-range'), `bytes */${mp4.length}`);
+    await invalidRange.arrayBuffer();
+    const legacy = await fetch(`${local}/api/media/${encodeURIComponent(`media:${mediaName}`)}`, { headers: bearer });
+    assert.equal(legacy.status, 200);
+    assert.deepEqual(Buffer.from(await legacy.arrayBuffer()), mp4);
+    pass('真实桥经回环中转保留路径/认证/UTF-8 文件名/MIME，HEAD 与 Range 行为一致');
+
+    const before = relay.binaryFrames();
+    const large = await fetch(relayUrl(filePath), { headers: bearer });
+    assert.equal(large.status, 200);
+    assert.equal(large.headers.get('content-length'), String(file.bytes));
+    const hash = crypto.createHash('sha256');
+    let received = 0;
+    for await (const chunk of large.body) {
+      received += chunk.length;
+      hash.update(chunk);
+    }
+    assert.equal(received, file.bytes);
+    assert.equal(`sha256:${hash.digest('hex')}`, file.attachmentId);
+    assert.ok(relay.binaryFrames() - before > 1, '大附件需要多个原始二进制帧');
+    pass('真实桥通过回环中转流式下载 21 MiB 文件，逐字节校验摘要');
+  } finally {
+    phone?.terminate();
+    for (const dispose of disposers) dispose?.();
+    await relay?.close();
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true, maxRetries: 5 });
+  }
+}
+
 async function main() {
+  await runAttachmentFixture();
   const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-bridge-smoke-'));
   const tokenFile = join(tmpDir, 'tokens.json');
   const runtimeFile = join(tmpDir, 'runtime.json');
@@ -2048,6 +2315,15 @@ async function main() {
   assert.ok(transportI.status().tunnelError.includes('中转'), 'relay 缺地址错误应可读');
   await transportI.stop();
   pass('named 缺 publicUrl 报错降级 / relay 缺参数给出可读错误');
+
+  // 官方中转默认地址迁移，不覆盖用户明确配置的自建服务。
+  assert.equal(DEFAULT_RELAY_ENDPOINT, 'wss://relay.cgly.top', '默认中转服务必须使用新域名');
+  assert.equal(normalize({}).relay.endpoint, DEFAULT_RELAY_ENDPOINT, '新安装应默认使用新中转服务');
+  assert.equal(normalize({ relay: { endpoint: 'wss://custom.example.com' } }).relay.endpoint,
+    'wss://custom.example.com', '用户自建中转地址必须保留');
+  assert.equal(relayPublicUrl(DEFAULT_RELAY_ENDPOINT, 'abc123xy'),
+    'https://relay.cgly.top/p/abc123xy', '手机地址必须保留路由码并使用新域名');
+  pass('官方中转新域名默认值 / 自建地址保留 / 手机地址生成');
 
   // 27c) 官方中转：完整通道行为（假 WS / 假 fetch，不碰真实网络）
   const relayScenarios = await runRelayScenarios();
